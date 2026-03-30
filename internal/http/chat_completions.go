@@ -204,26 +204,29 @@ func (h *ChatCompletionsHandler) handleResponsesNonStream(ctx context.Context, w
 	if len(resp.Choices) > 0 {
 		text = resp.Choices[0].Message.Content.Text
 	}
+	itemID := "msg_" + randomID()
 
 	payload := map[string]any{
-		"id":      "resp_" + randomID(),
-		"object":  "response",
+		"id":         "resp_" + randomID(),
+		"object":     "response",
 		"created_at": time.Now().Unix(),
-		"status":  "completed",
-		"model":   req.Model,
+		"status":     "completed",
+		"model":      req.Model,
 		"parallel_tool_calls": true,
-		"tool_choice": "auto",
-		"tools": []any{},
-		"top_p": 1.0,
+		"tool_choice":         "auto",
+		"tools":               []any{},
+		"top_p":               1.0,
 		"output": []any{
 			map[string]any{
+				"id":     itemID,
 				"type":   "message",
 				"role":   "assistant",
 				"status": "completed",
 				"content": []any{
 					map[string]any{
-						"type": "output_text",
-						"text": text,
+						"type":        "output_text",
+						"text":        text,
+						"annotations": []any{},
 					},
 				},
 			},
@@ -248,6 +251,7 @@ func (h *ChatCompletionsHandler) handleResponsesStream(ctx context.Context, w ht
 	respID := "resp_" + randomID()
 	itemID := "msg_" + randomID()
 	createdAt := time.Now().Unix()
+	var fullText strings.Builder
 
 	writeEvent := func(v map[string]any) error {
 		data, err := json.Marshal(v)
@@ -300,6 +304,7 @@ func (h *ChatCompletionsHandler) handleResponsesStream(ctx context.Context, w ht
 	})
 
 	err := h.customClient.ChatCompletionStream(ctx, req, func(delta string) error {
+		fullText.WriteString(delta)
 		return writeEvent(map[string]any{
 			"type":          "response.output_text.delta",
 			"delta":         delta,
@@ -325,7 +330,21 @@ func (h *ChatCompletionsHandler) handleResponsesStream(ctx context.Context, w ht
 				"created_at":          createdAt,
 				"status":              "completed",
 				"model":               req.Model,
-				"output":              []any{},
+				"output": []any{
+					map[string]any{
+						"id":     itemID,
+						"type":   "message",
+						"status": "completed",
+						"role":   "assistant",
+						"content": []any{
+							map[string]any{
+								"type":        "output_text",
+								"text":        fullText.String(),
+								"annotations": []any{},
+							},
+						},
+					},
+				},
 				"parallel_tool_calls": true,
 				"tool_choice":         "auto",
 				"tools":               []any{},
