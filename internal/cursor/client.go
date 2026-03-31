@@ -34,7 +34,7 @@ type Config struct {
 type Client interface {
 	ValidateModel(model string) error
 	ChatCompletion(ctx context.Context, req types.ChatCompletionRequest) (types.ChatCompletionResponse, error)
-	ChatCompletionStream(ctx context.Context, req types.ChatCompletionRequest, onChunk func(delta string) error) error
+	ChatCompletionStream(ctx context.Context, req types.ChatCompletionRequest, onChunk func(delta string) error) (types.Usage, error)
 }
 
 type client struct {
@@ -74,7 +74,7 @@ func (c *client) ChatCompletion(ctx context.Context, req types.ChatCompletionReq
 	}
 
 	var out strings.Builder
-	err := c.streamFromUpstream(ctx, req, func(delta string) error {
+	usage, err := c.streamFromUpstream(ctx, req, func(delta string) error {
 		out.WriteString(delta)
 		return nil
 	})
@@ -98,32 +98,32 @@ func (c *client) ChatCompletion(ctx context.Context, req types.ChatCompletionReq
 				FinishReason: "stop",
 			},
 		},
-		Usage: types.Usage{},
+		Usage: usage,
 	}
 	return resp, nil
 }
 
-func (c *client) ChatCompletionStream(ctx context.Context, req types.ChatCompletionRequest, onChunk func(delta string) error) error {
+func (c *client) ChatCompletionStream(ctx context.Context, req types.ChatCompletionRequest, onChunk func(delta string) error) (types.Usage, error) {
 	if err := c.ValidateModel(req.Model); err != nil {
-		return err
+		return types.Usage{}, err
 	}
 	return c.streamFromUpstream(ctx, req, onChunk)
 }
 
-func (c *client) streamFromUpstream(ctx context.Context, req types.ChatCompletionRequest, onChunk func(delta string) error) error {
+func (c *client) streamFromUpstream(ctx context.Context, req types.ChatCompletionRequest, onChunk func(delta string) error) (types.Usage, error) {
 	if strings.TrimSpace(c.cfg.APIURL) == "" {
-		return fmt.Errorf("CUSTOMAI_API_URL is required")
+		return types.Usage{}, fmt.Errorf("CUSTOMAI_API_URL is required")
 	}
 
 	upBody := buildUpstreamRequest(req, true, c.cfg.DefaultInstructions)
 	payload, err := json.Marshal(upBody)
 	if err != nil {
-		return err
+		return types.Usage{}, err
 	}
 
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.cfg.APIURL, bytes.NewReader(payload))
 	if err != nil {
-		return err
+		return types.Usage{}, err
 	}
 	if c.cfg.LogPayload {
 		maxChars := c.cfg.PayloadLogMaxChars
@@ -159,18 +159,19 @@ func (c *client) streamFromUpstream(ctx context.Context, req types.ChatCompletio
 
 	resp, err := c.httpClient.Do(httpReq)
 	if err != nil {
-		return err
+		return types.Usage{}, err
 	}
 	defer resp.Body.Close()
 	log.Printf("[upstream] status=%d url=%s", resp.StatusCode, httpReq.URL.String())
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 8192))
-		return fmt.Errorf("upstream status %d: %s", resp.StatusCode, strings.TrimSpace(string(raw)))
+		return types.Usage{}, fmt.Errorf("upstream status %d: %s", resp.StatusCode, strings.TrimSpace(string(raw)))
 	}
 
 	scanner := bufio.NewScanner(resp.Body)
 	scanner.Buffer(make([]byte, 0, 64*1024), 2*1024*1024)
+	usage := types.Usage{}
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
 		if line == "" || strings.HasPrefix(line, "event:") {
@@ -184,23 +185,26 @@ func (c *client) streamFromUpstream(ctx context.Context, req types.ChatCompletio
 			continue
 		}
 
-		delta, done, err := parseStreamData(data)
+		delta, done, parsedUsage, err := parseStreamData(data)
 		if err != nil {
-			return err
+			return types.Usage{}, err
+		}
+		if parsedUsage != (types.Usage{}) {
+			usage = parsedUsage
 		}
 		if delta != "" {
 			if err := onChunk(delta); err != nil {
-				return err
+				return types.Usage{}, err
 			}
 		}
 		if done {
-			return nil
+			return usage, nil
 		}
 	}
 	if err := scanner.Err(); err != nil {
-		return err
+		return types.Usage{}, err
 	}
-	return nil
+	return usage, nil
 }
 
 type upstreamRequest struct {
@@ -292,7 +296,7 @@ func normalizeBearer(token string) string {
 	return "Bearer " + token
 }
 
-func parseStreamData(data string) (delta string, done bool, err error) {
+func parseStreamData(data string) (delta string, done bool, usage types.Usage, err error) {
 	var event struct {
 		Type  string `json:"type"`
 		Delta string `json:"delta"`
@@ -303,26 +307,38 @@ func parseStreamData(data string) (delta string, done bool, err error) {
 			Error *struct {
 				Message string `json:"message"`
 			} `json:"error,omitempty"`
+			Usage *struct {
+				InputTokens  int `json:"input_tokens"`
+				OutputTokens int `json:"output_tokens"`
+				TotalTokens  int `json:"total_tokens"`
+			} `json:"usage,omitempty"`
 		} `json:"response,omitempty"`
 	}
 	if err := json.Unmarshal([]byte(data), &event); err != nil {
-		return "", false, nil
+		return "", false, types.Usage{}, nil
 	}
 
 	switch event.Type {
 	case "response.output_text.delta":
-		return event.Delta, false, nil
+		return event.Delta, false, types.Usage{}, nil
 	case "response.completed":
-		return "", true, nil
+		if event.Response != nil && event.Response.Usage != nil {
+			usage = types.Usage{
+				PromptTokens:     event.Response.Usage.InputTokens,
+				CompletionTokens: event.Response.Usage.OutputTokens,
+				TotalTokens:      event.Response.Usage.TotalTokens,
+			}
+		}
+		return "", true, usage, nil
 	case "response.failed", "response.error", "error":
 		if event.Error != nil && event.Error.Message != "" {
-			return "", false, fmt.Errorf(event.Error.Message)
+			return "", false, types.Usage{}, fmt.Errorf(event.Error.Message)
 		}
 		if event.Response != nil && event.Response.Error != nil && event.Response.Error.Message != "" {
-			return "", false, fmt.Errorf(event.Response.Error.Message)
+			return "", false, types.Usage{}, fmt.Errorf(event.Response.Error.Message)
 		}
-		return "", false, fmt.Errorf("upstream error: %s", event.Type)
+		return "", false, types.Usage{}, fmt.Errorf("upstream error: %s", event.Type)
 	default:
-		return "", false, nil
+		return "", false, types.Usage{}, nil
 	}
 }

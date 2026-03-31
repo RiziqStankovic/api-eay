@@ -133,7 +133,7 @@ func (h *ChatCompletionsHandler) handleStream(ctx context.Context, w http.Respon
 	chunkID := "chatcmpl-" + randomID()
 	created := time.Now().Unix()
 
-	err := h.customClient.ChatCompletionStream(ctx, req, func(delta string) error {
+	_, err := h.customClient.ChatCompletionStream(ctx, req, func(delta string) error {
 		chunk := types.ChatCompletionStreamChunk{
 			ID:      chunkID,
 			Object:  "chat.completion.chunk",
@@ -231,6 +231,11 @@ func (h *ChatCompletionsHandler) handleResponsesNonStream(ctx context.Context, w
 				},
 			},
 		},
+		"usage": map[string]any{
+			"input_tokens":  resp.Usage.PromptTokens,
+			"output_tokens": resp.Usage.CompletionTokens,
+			"total_tokens":  resp.Usage.TotalTokens,
+		},
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(payload)
@@ -303,7 +308,7 @@ func (h *ChatCompletionsHandler) handleResponsesStream(ctx context.Context, w ht
 		},
 	})
 
-	err := h.customClient.ChatCompletionStream(ctx, req, func(delta string) error {
+	usage, err := h.customClient.ChatCompletionStream(ctx, req, func(delta string) error {
 		fullText.WriteString(delta)
 		return writeEvent(map[string]any{
 			"type":          "response.output_text.delta",
@@ -349,6 +354,11 @@ func (h *ChatCompletionsHandler) handleResponsesStream(ctx context.Context, w ht
 				"tool_choice":         "auto",
 				"tools":               []any{},
 				"top_p":               1.0,
+				"usage": map[string]any{
+					"input_tokens":  usage.PromptTokens,
+					"output_tokens": usage.CompletionTokens,
+					"total_tokens":  usage.TotalTokens,
+				},
 			},
 		})
 	}
