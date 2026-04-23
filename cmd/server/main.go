@@ -14,6 +14,7 @@ import (
 	"github.com/joho/godotenv"
 	"github.com/openclaw/customai-gateway-go/internal/cursor"
 	httpapi "github.com/openclaw/customai-gateway-go/internal/http"
+	"github.com/openclaw/customai-gateway-go/internal/requestid"
 )
 
 func main() {
@@ -21,13 +22,20 @@ func main() {
 	port := getEnv("PORT", "8002")
 
 	cfg := cursor.Config{
-		APIURL:     getEnv("CUSTOMAI_API_URL", "https://cloudfren.com/backend-api/codex/responses"),
-		AuthToken:  strings.TrimSpace(os.Getenv("CUSTOMAI_AUTH_TOKEN")),
-		Cookie:     strings.TrimSpace(os.Getenv("CUSTOMAI_COOKIE")),
-		RequestTTL: parseDurationSeconds(os.Getenv("CUSTOMAI_TIMEOUT"), 180),
+		APIURL:              getEnv("CUSTOMAI_API_URL", "https://cloudfren.com/backend-api/codex/responses"),
+		AuthToken:           strings.TrimSpace(os.Getenv("CUSTOMAI_AUTH_TOKEN")),
+		RefreshToken:        strings.TrimSpace(os.Getenv("CUSTOMAI_REFRESH_TOKEN")),
+		TokenURL:            strings.TrimSpace(os.Getenv("CUSTOMAI_TOKEN_URL")),
+		OAuthClientID:       strings.TrimSpace(os.Getenv("CUSTOMAI_OAUTH_CLIENT_ID")),
+		TokenScopes:         parseCommaOrSpaceList(os.Getenv("CUSTOMAI_TOKEN_SCOPES")),
+		TokenExpiresAt:      parseUnixMillisEnv(os.Getenv("CUSTOMAI_TOKEN_EXPIRES_AT")),
+		RefreshBuffer:       parseDurationSeconds(os.Getenv("CUSTOMAI_REFRESH_BUFFER_SECONDS"), 300),
+		TokenStorePath:      strings.TrimSpace(getEnv("CUSTOMAI_TOKEN_STORE_PATH", ".customai-tokens.json")),
+		Cookie:              strings.TrimSpace(os.Getenv("CUSTOMAI_COOKIE")),
+		RequestTTL:          parseDurationSeconds(os.Getenv("CUSTOMAI_TIMEOUT"), 180),
 		DefaultInstructions: strings.TrimSpace(getEnv("CUSTOMAI_DEFAULT_INSTRUCTIONS", "You are a helpful coding assistant.")),
-		LogPayload: parseBoolEnv(os.Getenv("CUSTOMAI_LOG_PAYLOAD")),
-		PayloadLogMaxChars: parseIntEnv(os.Getenv("CUSTOMAI_LOG_PAYLOAD_MAX_CHARS"), 4000),
+		LogPayload:          parseBoolEnv(os.Getenv("CUSTOMAI_LOG_PAYLOAD")),
+		PayloadLogMaxChars:  parseIntEnv(os.Getenv("CUSTOMAI_LOG_PAYLOAD_MAX_CHARS"), 4000),
 		ExtraHeaders: parseExtraHeaders(
 			os.Getenv("CUSTOMAI_EXTRA_HEADERS"),
 			map[string]string{
@@ -133,6 +141,38 @@ func parseIntEnv(raw string, def int) int {
 	return n
 }
 
+func parseUnixMillisEnv(raw string) time.Time {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return time.Time{}
+	}
+	n, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || n <= 0 {
+		return time.Time{}
+	}
+	return time.UnixMilli(n)
+}
+
+func parseCommaOrSpaceList(raw string) []string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
+	}
+	raw = strings.ReplaceAll(raw, ",", " ")
+	parts := strings.Fields(raw)
+	if len(parts) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(parts))
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part != "" {
+			out = append(out, part)
+		}
+	}
+	return out
+}
+
 // parseExtraHeaders parses "Key: Value||Key2: Value2" and merges with explicit headers.
 func parseExtraHeaders(raw string, explicit map[string]string) map[string]string {
 	out := map[string]string{}
@@ -185,10 +225,14 @@ func (sr *statusRecorder) Flush() {
 func loggingMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
+		reqID := requestid.Normalize(r.Header.Get("X-Request-Id"))
+		w.Header().Set("X-Request-Id", reqID)
+		r = r.WithContext(requestid.WithContext(r.Context(), reqID))
 		rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
 		next.ServeHTTP(rec, r)
 		log.Printf(
-			"[gateway] method=%s path=%s status=%d duration_ms=%d remote=%s ua=%q",
+			"[gateway] request_id=%s method=%s path=%s status=%d duration_ms=%d remote=%s ua=%q",
+			reqID,
 			r.Method,
 			r.URL.Path,
 			rec.status,

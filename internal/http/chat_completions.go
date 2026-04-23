@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/openclaw/customai-gateway-go/internal/cursor"
+	"github.com/openclaw/customai-gateway-go/internal/requestid"
 	"github.com/openclaw/customai-gateway-go/internal/types"
 )
 
@@ -67,7 +68,7 @@ func (h *ChatCompletionsHandler) ServeHTTP(w http.ResponseWriter, r *http.Reques
 		if len(preview) > 400 {
 			preview = preview[:400] + "..."
 		}
-		log.Printf("[gateway] invalid request JSON: %v body=%q", err, preview)
+		log.Printf("[gateway] request_id=%s invalid request JSON: %v body=%q", requestid.FromContext(r.Context()), err, preview)
 		writeError(w, http.StatusBadRequest, "invalid JSON body")
 		return
 	}
@@ -107,14 +108,14 @@ func (h *ChatCompletionsHandler) ServeHTTP(w http.ResponseWriter, r *http.Reques
 func (h *ChatCompletionsHandler) handleNonStream(ctx context.Context, w http.ResponseWriter, req types.ChatCompletionRequest) {
 	resp, err := h.customClient.ChatCompletion(ctx, req)
 	if err != nil {
-		log.Printf("customai ChatCompletion error: %v", err)
+		log.Printf("customai ChatCompletion error request_id=%s: %v", requestid.FromContext(ctx), err)
 		writeError(w, http.StatusBadGateway, "customai backend error")
 		return
 	}
 
 	w.Header().Set("Content-Type", "application/json")
 	if err := json.NewEncoder(w).Encode(resp); err != nil {
-		log.Printf("encode response error: %v", err)
+		log.Printf("encode response error request_id=%s: %v", requestid.FromContext(ctx), err)
 	}
 }
 
@@ -158,10 +159,10 @@ func (h *ChatCompletionsHandler) handleStream(ctx context.Context, w http.Respon
 		return nil
 	})
 	if err != nil {
-		log.Printf("customai ChatCompletionStream error: %v", err)
+		log.Printf("customai ChatCompletionStream error request_id=%s: %v", requestid.FromContext(ctx), err)
 		payload, _ := json.Marshal(map[string]string{"error": err.Error()})
 		if _, writeErr := bw.WriteString("event: error\ndata: " + string(payload) + "\n\n"); writeErr != nil {
-			log.Printf("write stream error event: %v", writeErr)
+			log.Printf("write stream error event request_id=%s: %v", requestid.FromContext(ctx), writeErr)
 		}
 		_ = bw.Flush()
 		flusher.Flush()
@@ -183,11 +184,11 @@ func (h *ChatCompletionsHandler) handleStream(ctx context.Context, w http.Respon
 	}
 	if data, marshalErr := json.Marshal(finalChunk); marshalErr == nil {
 		if _, writeErr := bw.WriteString("data: " + string(data) + "\n\n"); writeErr != nil {
-			log.Printf("write final chunk error: %v", writeErr)
+			log.Printf("write final chunk error request_id=%s: %v", requestid.FromContext(ctx), writeErr)
 		}
 	}
 	if _, err := bw.WriteString("data: [DONE]\n\n"); err != nil {
-		log.Printf("write [DONE] error: %v", err)
+		log.Printf("write [DONE] error request_id=%s: %v", requestid.FromContext(ctx), err)
 	}
 	_ = bw.Flush()
 	flusher.Flush()
@@ -196,7 +197,7 @@ func (h *ChatCompletionsHandler) handleStream(ctx context.Context, w http.Respon
 func (h *ChatCompletionsHandler) handleResponsesNonStream(ctx context.Context, w http.ResponseWriter, req types.ChatCompletionRequest) {
 	resp, err := h.customClient.ChatCompletion(ctx, req)
 	if err != nil {
-		log.Printf("customai Responses non-stream error: %v", err)
+		log.Printf("customai Responses non-stream error request_id=%s: %v", requestid.FromContext(ctx), err)
 		writeError(w, http.StatusBadGateway, "customai backend error")
 		return
 	}
@@ -207,11 +208,11 @@ func (h *ChatCompletionsHandler) handleResponsesNonStream(ctx context.Context, w
 	itemID := "msg_" + randomID()
 
 	payload := map[string]any{
-		"id":         "resp_" + randomID(),
-		"object":     "response",
-		"created_at": time.Now().Unix(),
-		"status":     "completed",
-		"model":      req.Model,
+		"id":                  "resp_" + randomID(),
+		"object":              "response",
+		"created_at":          time.Now().Unix(),
+		"status":              "completed",
+		"model":               req.Model,
 		"parallel_tool_calls": true,
 		"tool_choice":         "auto",
 		"tools":               []any{},
@@ -274,16 +275,16 @@ func (h *ChatCompletionsHandler) handleResponsesStream(ctx context.Context, w ht
 	_ = writeEvent(map[string]any{
 		"type": "response.created",
 		"response": map[string]any{
-			"id":         respID,
-			"object":     "response",
-			"created_at": createdAt,
-			"status":     "in_progress",
-			"model":      req.Model,
-			"output":     []any{},
+			"id":                  respID,
+			"object":              "response",
+			"created_at":          createdAt,
+			"status":              "in_progress",
+			"model":               req.Model,
+			"output":              []any{},
 			"parallel_tool_calls": true,
-			"tool_choice": "auto",
-			"tools":      []any{},
-			"top_p":      1.0,
+			"tool_choice":         "auto",
+			"tools":               []any{},
+			"top_p":               1.0,
 		},
 	})
 	_ = writeEvent(map[string]any{
@@ -319,7 +320,7 @@ func (h *ChatCompletionsHandler) handleResponsesStream(ctx context.Context, w ht
 		})
 	})
 	if err != nil {
-		log.Printf("customai Responses stream error: %v", err)
+		log.Printf("customai Responses stream error request_id=%s: %v", requestid.FromContext(ctx), err)
 		_ = writeEvent(map[string]any{
 			"type": "error",
 			"error": map[string]any{
@@ -330,11 +331,11 @@ func (h *ChatCompletionsHandler) handleResponsesStream(ctx context.Context, w ht
 		_ = writeEvent(map[string]any{
 			"type": "response.completed",
 			"response": map[string]any{
-				"id":                  respID,
-				"object":              "response",
-				"created_at":          createdAt,
-				"status":              "completed",
-				"model":               req.Model,
+				"id":         respID,
+				"object":     "response",
+				"created_at": createdAt,
+				"status":     "completed",
+				"model":      req.Model,
 				"output": []any{
 					map[string]any{
 						"id":     itemID,
@@ -364,7 +365,7 @@ func (h *ChatCompletionsHandler) handleResponsesStream(ctx context.Context, w ht
 	}
 
 	if _, doneErr := bw.WriteString("data: [DONE]\n\n"); doneErr != nil {
-		log.Printf("write [DONE] error: %v", doneErr)
+		log.Printf("write [DONE] error request_id=%s: %v", requestid.FromContext(ctx), doneErr)
 	}
 	_ = bw.Flush()
 	flusher.Flush()

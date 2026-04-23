@@ -5,46 +5,178 @@ import (
 	"strings"
 )
 
-// MessageContent handles OpenAI content: string or array of parts (text, image_url).
-// Extracts text and ignores non-text parts.
+// MessageContent handles OpenAI content: string or multimodal content parts.
 type MessageContent struct {
-	Text string
+	Text  string
+	Parts []MessageContentPart
+}
+
+type MessageContentPart struct {
+	Type     string
+	Text     string
+	ImageURL string
+	Detail   string
 }
 
 func (c *MessageContent) UnmarshalJSON(data []byte) error {
+	*c = MessageContent{}
+
 	var s string
 	if err := json.Unmarshal(data, &s); err == nil {
 		c.Text = s
 		return nil
 	}
-	var single struct {
-		Type string `json:"type"`
-		Text string `json:"text"`
-	}
-	if err := json.Unmarshal(data, &single); err == nil {
-		c.Text = strings.TrimSpace(single.Text)
+
+	var single rawContentPart
+	if err := json.Unmarshal(data, &single); err == nil && strings.TrimSpace(single.Type) != "" {
+		part := normalizeContentPart(single)
+		c.Parts = appendPart(c.Parts, part)
+		c.Text = partsText(c.Parts)
 		return nil
 	}
-	var parts []struct {
-		Type string `json:"type"`
-		Text string `json:"text"`
-	}
-	if err := json.Unmarshal(data, &parts); err != nil {
+
+	var rawParts []rawContentPart
+	if err := json.Unmarshal(data, &rawParts); err != nil {
 		return err
 	}
-	var b strings.Builder
-	for _, p := range parts {
-		pt := strings.ToLower(strings.TrimSpace(p.Type))
-		if (pt == "text" || pt == "input_text" || pt == "output_text") && p.Text != "" {
-			b.WriteString(p.Text)
-		}
+	for _, p := range rawParts {
+		c.Parts = appendPart(c.Parts, normalizeContentPart(p))
 	}
-	c.Text = b.String()
+	c.Text = partsText(c.Parts)
 	return nil
 }
 
 func (c MessageContent) MarshalJSON() ([]byte, error) {
-	return json.Marshal(c.Text)
+	if len(c.Parts) == 0 {
+		return json.Marshal(c.Text)
+	}
+	out := make([]responseContentPart, 0, len(c.Parts))
+	for _, part := range c.Parts {
+		switch part.Type {
+		case "input_text":
+			if part.Text == "" {
+				continue
+			}
+			out = append(out, responseContentPart{
+				Type: "input_text",
+				Text: part.Text,
+			})
+		case "input_image":
+			if part.ImageURL == "" {
+				continue
+			}
+			detail := strings.TrimSpace(part.Detail)
+			if detail == "" {
+				detail = "auto"
+			}
+			out = append(out, responseContentPart{
+				Type:     "input_image",
+				ImageURL: part.ImageURL,
+				Detail:   detail,
+			})
+		}
+	}
+	if len(out) == 0 {
+		return json.Marshal(c.Text)
+	}
+	if !hasImagePart(c.Parts) {
+		return json.Marshal(c.Text)
+	}
+	return json.Marshal(out)
+}
+
+func (c MessageContent) PlainText() string {
+	return c.Text
+}
+
+func (c MessageContent) HasImage() bool {
+	return hasImagePart(c.Parts)
+}
+
+type rawContentPart struct {
+	Type     string `json:"type"`
+	Text     string `json:"text"`
+	ImageURL any    `json:"image_url"`
+	Detail   string `json:"detail"`
+}
+
+type responseContentPart struct {
+	Type     string `json:"type"`
+	Text     string `json:"text,omitempty"`
+	ImageURL string `json:"image_url,omitempty"`
+	Detail   string `json:"detail,omitempty"`
+}
+
+func normalizeContentPart(p rawContentPart) MessageContentPart {
+	partType := strings.ToLower(strings.TrimSpace(p.Type))
+	switch partType {
+	case "text", "input_text":
+		return MessageContentPart{Type: "input_text", Text: p.Text}
+	case "image_url", "input_image":
+		imageURL, detail := extractImageURL(p.ImageURL)
+		if p.Detail != "" {
+			detail = p.Detail
+		}
+		return MessageContentPart{
+			Type:     "input_image",
+			ImageURL: imageURL,
+			Detail:   detail,
+		}
+	default:
+		if p.Text != "" {
+			return MessageContentPart{Type: "input_text", Text: p.Text}
+		}
+		return MessageContentPart{}
+	}
+}
+
+func extractImageURL(v any) (string, string) {
+	switch value := v.(type) {
+	case string:
+		return value, ""
+	case map[string]any:
+		detail, _ := value["detail"].(string)
+		if url, ok := value["url"].(string); ok {
+			return url, detail
+		}
+	}
+	return "", ""
+}
+
+func appendPart(parts []MessageContentPart, part MessageContentPart) []MessageContentPart {
+	if part.Type == "" {
+		return parts
+	}
+	if part.Type == "input_text" && part.Text == "" {
+		return parts
+	}
+	if part.Type == "input_image" && part.ImageURL == "" {
+		return parts
+	}
+	return append(parts, part)
+}
+
+func partsText(parts []MessageContentPart) string {
+	var b strings.Builder
+	for _, part := range parts {
+		if part.Type != "input_text" || part.Text == "" {
+			continue
+		}
+		if b.Len() > 0 {
+			b.WriteString("\n")
+		}
+		b.WriteString(part.Text)
+	}
+	return b.String()
+}
+
+func hasImagePart(parts []MessageContentPart) bool {
+	for _, part := range parts {
+		if part.Type == "input_image" && part.ImageURL != "" {
+			return true
+		}
+	}
+	return false
 }
 
 // ChatCompletionRequest is a minimal subset of the OpenAI Chat Completions API
@@ -64,11 +196,11 @@ type ChatCompletionRequest struct {
 // AltChatRequest is an alternate body format (e.g. instructions + input array).
 // Used when the client sends { "instructions", "input" } instead of "messages".
 type AltChatRequest struct {
-	Model         string         `json:"model"`
-	Instructions  string         `json:"instructions,omitempty"`
-	Input         []AltInputItem `json:"input,omitempty"`
-	Stream        bool           `json:"stream,omitempty"`
-	Store         bool           `json:"store,omitempty"`
+	Model        string         `json:"model"`
+	Instructions string         `json:"instructions,omitempty"`
+	Input        []AltInputItem `json:"input,omitempty"`
+	Stream       bool           `json:"stream,omitempty"`
+	Store        bool           `json:"store,omitempty"`
 }
 
 // AltInputItem is one entry in the "input" array (type "message" with role + content).
@@ -94,7 +226,7 @@ func (a AltChatRequest) ToChatCompletionRequest() ChatCompletionRequest {
 		if item.Role == "" {
 			continue
 		}
-		messages = append(messages, ChatCompletionMessage{Role: item.Role, Content: MessageContent{Text: item.Content.Text}})
+		messages = append(messages, ChatCompletionMessage{Role: item.Role, Content: item.Content})
 	}
 	return ChatCompletionRequest{
 		Model:    a.Model,
@@ -119,9 +251,9 @@ type ChatCompletionResponse struct {
 }
 
 type ChatCompletionResponseChoice struct {
-	Index        int                          `json:"index"`
-	Message      ChatCompletionMessage        `json:"message"`
-	FinishReason string                       `json:"finish_reason"`
+	Index        int                   `json:"index"`
+	Message      ChatCompletionMessage `json:"message"`
+	FinishReason string                `json:"finish_reason"`
 }
 
 type Usage struct {
@@ -132,18 +264,18 @@ type Usage struct {
 
 // ChatCompletionStreamChunk is used for SSE / streaming responses.
 type ChatCompletionStreamChunk struct {
-	ID      string                             `json:"id"`
-	Object  string                             `json:"object"`
-	Created int64                              `json:"created"`
-	Model   string                             `json:"model"`
-	Choices []ChatCompletionStreamChunkChoice  `json:"choices"`
+	ID      string                            `json:"id"`
+	Object  string                            `json:"object"`
+	Created int64                             `json:"created"`
+	Model   string                            `json:"model"`
+	Choices []ChatCompletionStreamChunkChoice `json:"choices"`
 }
 
 type ChatCompletionStreamChunkChoice struct {
-	Index int                              `json:"index"`
-	Delta ChatCompletionStreamChunkDelta   `json:"delta"`
+	Index int                            `json:"index"`
+	Delta ChatCompletionStreamChunkDelta `json:"delta"`
 	// FinishReason is usually only set on the final chunk.
-	FinishReason *string                   `json:"finish_reason,omitempty"`
+	FinishReason *string `json:"finish_reason,omitempty"`
 }
 
 type ChatCompletionStreamChunkDelta struct {
