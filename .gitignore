@@ -1,3 +1,4 @@
 .env.example
 auth-profiles.json
 auth-profiles copy.json
+.env

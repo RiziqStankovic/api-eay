@@ -219,15 +219,21 @@ type AltChatRequest struct {
 	Thinking          any              `json:"thinking,omitempty"`
 }
 
-// AltInputItem is one entry in the "input" array (type "message" with role + content).
+// AltInputItem is one entry in the Responses-style "input" array.
 type AltInputItem struct {
-	Type    string         `json:"type,omitempty"` // e.g. "message"
-	Role    string         `json:"role,omitempty"` // user, assistant, system
-	Content MessageContent `json:"content,omitempty"`
+	Type      string         `json:"type,omitempty"` // message, function_call, function_call_output
+	ID        string         `json:"id,omitempty"`
+	CallID    string         `json:"call_id,omitempty"`
+	Role      string         `json:"role,omitempty"` // user, assistant, system
+	Content   MessageContent `json:"content,omitempty"`
+	Name      string         `json:"name,omitempty"`
+	Arguments string         `json:"arguments,omitempty"`
+	Output    string         `json:"output,omitempty"`
 }
 
 // ToChatCompletionRequest converts AltChatRequest to ChatCompletionRequest.
-// Instructions become a system message; each input item with type "message" becomes a message.
+// Instructions become a system message; Responses function_call/function_call_output
+// items are preserved as assistant tool_calls and tool result messages.
 func (a AltChatRequest) ToChatCompletionRequest() ChatCompletionRequest {
 	var messages []ChatCompletionMessage
 	if a.Instructions != "" {
@@ -235,14 +241,44 @@ func (a AltChatRequest) ToChatCompletionRequest() ChatCompletionRequest {
 	}
 	for _, item := range a.Input {
 		itemType := strings.TrimSpace(strings.ToLower(item.Type))
-		// Responses API often omits item.type; treat role-bearing item as a message.
-		if itemType != "" && itemType != "message" {
+		switch itemType {
+		case "", "message":
+			// Responses API often omits item.type; treat role-bearing item as a message.
+			if item.Role == "" {
+				continue
+			}
+			messages = append(messages, ChatCompletionMessage{Role: item.Role, Content: item.Content})
+		case "function_call":
+			callID := firstNonEmpty(item.CallID, item.ID)
+			if callID == "" || strings.TrimSpace(item.Name) == "" {
+				continue
+			}
+			messages = append(messages, ChatCompletionMessage{
+				Role: "assistant",
+				ToolCalls: []ToolCall{
+					{
+						ID:   callID,
+						Type: "function",
+						Function: ToolCallFunction{
+							Name:      item.Name,
+							Arguments: firstNonEmpty(item.Arguments, "{}"),
+						},
+					},
+				},
+			})
+		case "function_call_output":
+			callID := firstNonEmpty(item.CallID, item.ID)
+			if callID == "" {
+				continue
+			}
+			messages = append(messages, ChatCompletionMessage{
+				Role:       "tool",
+				ToolCallID: callID,
+				Content:    MessageContent{Text: item.Output},
+			})
+		default:
 			continue
 		}
-		if item.Role == "" {
-			continue
-		}
-		messages = append(messages, ChatCompletionMessage{Role: item.Role, Content: item.Content})
 	}
 	return ChatCompletionRequest{
 		Model:             a.Model,
@@ -255,6 +291,15 @@ func (a AltChatRequest) ToChatCompletionRequest() ChatCompletionRequest {
 		ReasoningEffort:   a.ReasoningEffort,
 		Thinking:          a.Thinking,
 	}
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if trimmed := strings.TrimSpace(value); trimmed != "" {
+			return trimmed
+		}
+	}
+	return ""
 }
 
 type ChatCompletionMessage struct {
