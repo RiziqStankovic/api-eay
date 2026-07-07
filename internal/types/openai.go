@@ -221,14 +221,14 @@ type AltChatRequest struct {
 
 // AltInputItem is one entry in the Responses-style "input" array.
 type AltInputItem struct {
-	Type      string         `json:"type,omitempty"` // message, function_call, function_call_output
-	ID        string         `json:"id,omitempty"`
-	CallID    string         `json:"call_id,omitempty"`
-	Role      string         `json:"role,omitempty"` // user, assistant, system
-	Content   MessageContent `json:"content,omitempty"`
-	Name      string         `json:"name,omitempty"`
-	Arguments string         `json:"arguments,omitempty"`
-	Output    MessageContent `json:"output,omitempty"`
+	Type      string          `json:"type,omitempty"` // message, function_call, function_call_output
+	ID        string          `json:"id,omitempty"`
+	CallID    string          `json:"call_id,omitempty"`
+	Role      string          `json:"role,omitempty"` // user, assistant, system
+	Content   MessageContent  `json:"content,omitempty"`
+	Name      string          `json:"name,omitempty"`
+	Arguments string          `json:"arguments,omitempty"`
+	Output    *MessageContent `json:"output,omitempty"`
 }
 
 // ToChatCompletionRequest converts AltChatRequest to ChatCompletionRequest.
@@ -274,7 +274,7 @@ func (a AltChatRequest) ToChatCompletionRequest() ChatCompletionRequest {
 			messages = append(messages, ChatCompletionMessage{
 				Role:       "tool",
 				ToolCallID: callID,
-				Content:    MessageContent{Text: item.Output.PlainText()},
+				Content:    MessageContent{Text: plainTextContent(item.Output)},
 			})
 		default:
 			continue
@@ -291,6 +291,13 @@ func (a AltChatRequest) ToChatCompletionRequest() ChatCompletionRequest {
 		ReasoningEffort:   a.ReasoningEffort,
 		Thinking:          a.Thinking,
 	}
+}
+
+func plainTextContent(content *MessageContent) string {
+	if content == nil {
+		return ""
+	}
+	return content.PlainText()
 }
 
 func firstNonEmpty(values ...string) string {

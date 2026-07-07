@@ -52,6 +52,26 @@ func TestBuildUpstreamRequestPreservesImageParts(t *testing.T) {
 	}
 }
 
+func TestBuildUpstreamRequestOmitsOutputOnMessageInput(t *testing.T) {
+	req := types.ChatCompletionRequest{
+		Model: "gpt-5.4-mini",
+		Messages: []types.ChatCompletionMessage{
+			{Role: "user", Content: types.MessageContent{Text: "check this repo"}},
+		},
+	}
+
+	upstream := buildUpstreamRequest(req, true, "You are helpful.")
+	payload, err := json.Marshal(upstream)
+	if err != nil {
+		t.Fatalf("marshal upstream request: %v", err)
+	}
+
+	got := string(payload)
+	if strings.Contains(got, `"output"`) {
+		t.Fatalf("upstream payload unexpectedly contains output field: %s", got)
+	}
+}
+
 func TestBuildUpstreamRequestAddsZedToolGuidance(t *testing.T) {
 	req := types.ChatCompletionRequest{
 		Model: "gpt-5.4-mini",
