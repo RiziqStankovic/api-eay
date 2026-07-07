@@ -54,3 +54,30 @@ func TestMessageContentTextOnlyMarshalsAsString(t *testing.T) {
 		t.Fatalf("marshaled content = %s, want %s", got, want)
 	}
 }
+
+func TestChatCompletionMessageAllowsNullContentWithToolCalls(t *testing.T) {
+	raw := []byte(`{
+		"role": "assistant",
+		"content": null,
+		"tool_calls": [
+			{
+				"id": "call_123",
+				"type": "function",
+				"function": {
+					"name": "find_path"
+				}
+			}
+		]
+	}`)
+
+	var msg ChatCompletionMessage
+	if err := json.Unmarshal(raw, &msg); err != nil {
+		t.Fatalf("unmarshal message: %v", err)
+	}
+	if got, want := len(msg.ToolCalls), 1; got != want {
+		t.Fatalf("tool calls len = %d, want %d", got, want)
+	}
+	if got, want := msg.ToolCalls[0].Function.Name, "find_path"; got != want {
+		t.Fatalf("tool name = %q, want %q", got, want)
+	}
+}

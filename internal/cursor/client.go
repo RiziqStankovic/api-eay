@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -30,6 +31,7 @@ type Config struct {
 	TokenExpiresAt      time.Time
 	RefreshBuffer       time.Duration
 	TokenStorePath      string
+	TokenProfile        string
 	Cookie              string
 	RequestTTL          time.Duration
 	ExtraHeaders        map[string]string
@@ -41,8 +43,21 @@ type Config struct {
 
 type Client interface {
 	ValidateModel(model string) error
+	PreflightAuth(ctx context.Context) error
+	ForceRefreshAuth(ctx context.Context) error
+	SwitchAuthProfile() bool
+	ActiveAuthProfile() string
 	ChatCompletion(ctx context.Context, req types.ChatCompletionRequest) (types.ChatCompletionResponse, error)
 	ChatCompletionStream(ctx context.Context, req types.ChatCompletionRequest, onChunk func(delta string) error) (types.Usage, error)
+	ResponsesStream(ctx context.Context, req types.ChatCompletionRequest, onEvent func(StreamEvent) error) (types.Usage, error)
+}
+
+type StreamEvent struct {
+	Type        string
+	Delta       string
+	ToolCall    *types.ToolCall
+	OutputIndex int
+	Done        bool
 }
 
 type client struct {
@@ -78,14 +93,50 @@ func (c *client) ValidateModel(model string) error {
 	return ErrInvalidModel
 }
 
+func (c *client) PreflightAuth(ctx context.Context) error {
+	if c.tokens == nil {
+		return nil
+	}
+	_, err := c.tokens.authorization(ctx, false)
+	return err
+}
+
+func (c *client) ForceRefreshAuth(ctx context.Context) error {
+	if c.tokens == nil || !c.tokens.canRefresh() {
+		return nil
+	}
+	_, err := c.tokens.authorization(ctx, true)
+	return err
+}
+
+func (c *client) SwitchAuthProfile() bool {
+	if c.tokens == nil {
+		return false
+	}
+	return c.tokens.switchToNextProfile()
+}
+
+func (c *client) ActiveAuthProfile() string {
+	if c.tokens == nil {
+		return ""
+	}
+	return c.tokens.activeProfile()
+}
+
 func (c *client) ChatCompletion(ctx context.Context, req types.ChatCompletionRequest) (types.ChatCompletionResponse, error) {
 	if err := c.ValidateModel(req.Model); err != nil {
 		return types.ChatCompletionResponse{}, err
 	}
 
 	var out strings.Builder
-	usage, err := c.streamFromUpstream(ctx, req, func(delta string) error {
-		out.WriteString(delta)
+	var toolCalls []types.ToolCall
+	usage, err := c.streamFromUpstream(ctx, req, func(event StreamEvent) error {
+		if event.Delta != "" {
+			out.WriteString(event.Delta)
+		}
+		if event.ToolCall != nil {
+			toolCalls = upsertToolCall(toolCalls, *event.ToolCall)
+		}
 		return nil
 	})
 	if err != nil {
@@ -93,6 +144,10 @@ func (c *client) ChatCompletion(ctx context.Context, req types.ChatCompletionReq
 	}
 
 	now := time.Now().Unix()
+	finishReason := "stop"
+	if len(toolCalls) > 0 {
+		finishReason = "tool_calls"
+	}
 	resp := types.ChatCompletionResponse{
 		ID:      "chatcmpl-customai",
 		Object:  "chat.completion",
@@ -102,10 +157,11 @@ func (c *client) ChatCompletion(ctx context.Context, req types.ChatCompletionReq
 			{
 				Index: 0,
 				Message: types.ChatCompletionMessage{
-					Role:    "assistant",
-					Content: types.MessageContent{Text: out.String()},
+					Role:      "assistant",
+					Content:   types.MessageContent{Text: out.String()},
+					ToolCalls: toolCalls,
 				},
-				FinishReason: "stop",
+				FinishReason: finishReason,
 			},
 		},
 		Usage: usage,
@@ -117,10 +173,22 @@ func (c *client) ChatCompletionStream(ctx context.Context, req types.ChatComplet
 	if err := c.ValidateModel(req.Model); err != nil {
 		return types.Usage{}, err
 	}
-	return c.streamFromUpstream(ctx, req, onChunk)
+	return c.streamFromUpstream(ctx, req, func(event StreamEvent) error {
+		if event.Delta == "" {
+			return nil
+		}
+		return onChunk(event.Delta)
+	})
 }
 
-func (c *client) streamFromUpstream(ctx context.Context, req types.ChatCompletionRequest, onChunk func(delta string) error) (types.Usage, error) {
+func (c *client) ResponsesStream(ctx context.Context, req types.ChatCompletionRequest, onEvent func(StreamEvent) error) (types.Usage, error) {
+	if err := c.ValidateModel(req.Model); err != nil {
+		return types.Usage{}, err
+	}
+	return c.streamFromUpstream(ctx, req, onEvent)
+}
+
+func (c *client) streamFromUpstream(ctx context.Context, req types.ChatCompletionRequest, onEvent func(StreamEvent) error) (types.Usage, error) {
 	if strings.TrimSpace(c.cfg.APIURL) == "" {
 		return types.Usage{}, fmt.Errorf("CUSTOMAI_API_URL is required")
 	}
@@ -133,20 +201,48 @@ func (c *client) streamFromUpstream(ctx context.Context, req types.ChatCompletio
 	}
 
 	wroteDelta := false
-	trackingOnChunk := func(delta string) error {
+	trackingOnEvent := func(event StreamEvent) error {
 		wroteDelta = true
-		return onChunk(delta)
+		return onEvent(event)
 	}
 
 	const maxAttempts = 3
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
-		usage, err := c.doUpstreamRequest(ctx, req, payload, false, trackingOnChunk)
+		usage, err := c.doUpstreamRequest(ctx, req, payload, false, trackingOnEvent)
 		if err == nil {
 			return usage, nil
 		}
 		if errors.Is(err, ErrTokenExpired) && c.tokens.canRefresh() {
 			log.Printf("[auth] request_id=%s upstream token expired, attempting refresh", reqID)
-			return c.doUpstreamRequest(ctx, req, payload, true, trackingOnChunk)
+			usage, refreshErr := c.doUpstreamRequest(ctx, req, payload, true, trackingOnEvent)
+			if refreshErr == nil {
+				return usage, nil
+			}
+			err = refreshErr
+		}
+		if isAuthProfileFailure(err) && !wroteDelta {
+			for c.SwitchAuthProfile() {
+				log.Printf("[auth] request_id=%s switching to fallback token profile profile=%q", reqID, c.ActiveAuthProfile())
+				usage, fallbackErr := c.doUpstreamRequest(ctx, req, payload, false, trackingOnEvent)
+				if fallbackErr == nil {
+					return usage, nil
+				}
+				err = fallbackErr
+				if errors.Is(err, ErrTokenExpired) && c.tokens.canRefresh() {
+					log.Printf("[auth] request_id=%s fallback token expired, attempting refresh profile=%q", reqID, c.ActiveAuthProfile())
+					usage, refreshErr := c.doUpstreamRequest(ctx, req, payload, true, trackingOnEvent)
+					if refreshErr == nil {
+						return usage, nil
+					}
+					err = refreshErr
+				}
+				if !isAuthProfileFailure(err) || wroteDelta {
+					break
+				}
+			}
+			if isAuthProfileFailure(err) {
+				log.Printf("[auth] request_id=%s no fallback token profile available after auth failure: %v", reqID, err)
+			}
 		}
 		if wroteDelta || !isTransientUpstreamError(err) || attempt == maxAttempts {
 			return types.Usage{}, err
@@ -160,7 +256,7 @@ func (c *client) streamFromUpstream(ctx context.Context, req types.ChatCompletio
 	return types.Usage{}, nil
 }
 
-func (c *client) doUpstreamRequest(ctx context.Context, req types.ChatCompletionRequest, payload []byte, forceRefresh bool, onChunk func(delta string) error) (types.Usage, error) {
+func (c *client) doUpstreamRequest(ctx context.Context, req types.ChatCompletionRequest, payload []byte, forceRefresh bool, onEvent func(StreamEvent) error) (types.Usage, error) {
 	reqID := requestid.FromContext(ctx)
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.cfg.APIURL, bytes.NewReader(payload))
 	if err != nil {
@@ -195,6 +291,9 @@ func (c *client) doUpstreamRequest(ctx context.Context, req types.ChatCompletion
 			continue
 		}
 		httpReq.Header.Set(k, v)
+	}
+	if accountID := chatGPTAccountIDFromToken(token); accountID != "" {
+		httpReq.Header.Set("ChatGPT-Account-Id", accountID)
 	}
 	log.Printf(
 		"[upstream] request_id=%s method=%s url=%s headers=%s model=%q stream=%v",
@@ -242,19 +341,19 @@ func (c *client) doUpstreamRequest(ctx context.Context, req types.ChatCompletion
 			continue
 		}
 
-		delta, done, parsedUsage, err := parseStreamData(data)
+		event, parsedUsage, err := parseStreamData(data)
 		if err != nil {
 			return types.Usage{}, err
 		}
 		if parsedUsage != (types.Usage{}) {
 			usage = parsedUsage
 		}
-		if delta != "" {
-			if err := onChunk(delta); err != nil {
+		if event.Type != "" && !event.Done {
+			if err := onEvent(event); err != nil {
 				return types.Usage{}, err
 			}
 		}
-		if done {
+		if event.Done {
 			return usage, nil
 		}
 	}
@@ -264,20 +363,81 @@ func (c *client) doUpstreamRequest(ctx context.Context, req types.ChatCompletion
 	return usage, nil
 }
 
+func isAuthProfileFailure(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, ErrTokenExpired) {
+		return true
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "refresh_token_reused") ||
+		strings.Contains(msg, "invalid_client") ||
+		strings.Contains(msg, "invalid_grant") ||
+		strings.Contains(msg, "token refresh failed")
+}
+
+func chatGPTAccountIDFromToken(token string) string {
+	token = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(token), "Bearer "))
+	parts := strings.Split(token, ".")
+	if len(parts) < 2 {
+		return ""
+	}
+	payloadRaw, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return ""
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(payloadRaw, &payload); err != nil {
+		return ""
+	}
+	if auth, ok := payload["https://api.openai.com/auth"].(map[string]any); ok {
+		if accountID, ok := auth["chatgpt_account_id"].(string); ok {
+			return strings.TrimSpace(accountID)
+		}
+	}
+	if accountID, ok := payload["https://api.openai.com/auth.chatgpt_account_id"].(string); ok {
+		return strings.TrimSpace(accountID)
+	}
+	if accountID, ok := payload["chatgpt_account_id"].(string); ok {
+		return strings.TrimSpace(accountID)
+	}
+	return ""
+}
+
 type upstreamRequest struct {
-	Model        string               `json:"model"`
-	Instructions string               `json:"instructions,omitempty"`
-	Input        []types.AltInputItem `json:"input"`
-	Stream       bool                 `json:"stream"`
-	Store        bool                 `json:"store"`
+	Model             string `json:"model"`
+	Instructions      string `json:"instructions,omitempty"`
+	Input             []any  `json:"input"`
+	Stream            bool   `json:"stream"`
+	Store             bool   `json:"store"`
+	Tools             []any  `json:"tools,omitempty"`
+	ToolChoice        any    `json:"tool_choice,omitempty"`
+	ParallelToolCalls *bool  `json:"parallel_tool_calls,omitempty"`
 }
 
 func buildUpstreamRequest(req types.ChatCompletionRequest, stream bool, defaultInstructions string) upstreamRequest {
 	var instructions []string
-	input := make([]types.AltInputItem, 0, len(req.Messages))
+	input := make([]any, 0, len(req.Messages))
 	for _, m := range req.Messages {
 		role := strings.TrimSpace(strings.ToLower(m.Role))
 		text := strings.TrimSpace(m.Content.PlainText())
+		if role == "assistant" && len(m.ToolCalls) > 0 {
+			for _, tc := range m.ToolCalls {
+				input = append(input, upstreamFunctionCallInput(tc))
+			}
+			if text == "" && !m.Content.HasImage() {
+				continue
+			}
+		}
+		if role == "tool" {
+			input = append(input, map[string]any{
+				"type":    "function_call_output",
+				"call_id": firstNonEmpty(m.ToolCallID, m.Name),
+				"output":  m.Content.PlainText(),
+			})
+			continue
+		}
 		if text == "" && !m.Content.HasImage() {
 			continue
 		}
@@ -309,12 +469,64 @@ func buildUpstreamRequest(req types.ChatCompletionRequest, stream bool, defaultI
 		joinedInstructions = "You are a helpful coding assistant."
 	}
 	return upstreamRequest{
-		Model:        req.Model,
-		Instructions: joinedInstructions,
-		Input:        input,
-		Stream:       stream,
-		Store:        false,
+		Model:             req.Model,
+		Instructions:      joinedInstructions,
+		Input:             input,
+		Stream:            stream,
+		Store:             false,
+		Tools:             normalizeToolsForResponses(req.Tools),
+		ToolChoice:        req.ToolChoice,
+		ParallelToolCalls: req.ParallelToolCalls,
 	}
+}
+
+func upstreamFunctionCallInput(tc types.ToolCall) map[string]any {
+	return map[string]any{
+		"type":      "function_call",
+		"call_id":   firstNonEmpty(tc.ID, "call_"+requestid.New()),
+		"name":      tc.Function.Name,
+		"arguments": firstNonEmpty(tc.Function.Arguments, "{}"),
+	}
+}
+
+func normalizeToolsForResponses(tools []types.ToolDefinition) []any {
+	if len(tools) == 0 {
+		return nil
+	}
+	out := make([]any, 0, len(tools))
+	for _, tool := range tools {
+		toolType := strings.TrimSpace(tool.Type)
+		if toolType == "" {
+			toolType = "function"
+		}
+		name := strings.TrimSpace(tool.Name)
+		description := tool.Description
+		parameters := tool.Parameters
+		if name == "" && strings.TrimSpace(tool.Function.Name) != "" {
+			name = strings.TrimSpace(tool.Function.Name)
+			description = tool.Function.Description
+			parameters = tool.Function.Parameters
+		}
+		if name == "" {
+			continue
+		}
+		out = append(out, map[string]any{
+			"type":        toolType,
+			"name":        name,
+			"description": description,
+			"parameters":  parameters,
+		})
+	}
+	return out
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if trimmed := strings.TrimSpace(value); trimmed != "" {
+			return trimmed
+		}
+	}
+	return ""
 }
 
 func redactedHeaders(h http.Header) string {
@@ -440,10 +652,20 @@ func normalizeBearer(token string) string {
 	return "Bearer " + token
 }
 
-func parseStreamData(data string) (delta string, done bool, usage types.Usage, err error) {
-	var event struct {
-		Type  string `json:"type"`
-		Delta string `json:"delta"`
+func parseStreamData(data string) (StreamEvent, types.Usage, error) {
+	var raw struct {
+		Type        string `json:"type"`
+		Delta       string `json:"delta"`
+		OutputIndex int    `json:"output_index"`
+		ItemID      string `json:"item_id"`
+		Item        *struct {
+			ID        string `json:"id"`
+			CallID    string `json:"call_id"`
+			Type      string `json:"type"`
+			Name      string `json:"name"`
+			Arguments string `json:"arguments"`
+			Status    string `json:"status"`
+		} `json:"item,omitempty"`
 		Error *struct {
 			Message string `json:"message"`
 			Code    string `json:"code"`
@@ -460,37 +682,104 @@ func parseStreamData(data string) (delta string, done bool, usage types.Usage, e
 			} `json:"usage,omitempty"`
 		} `json:"response,omitempty"`
 	}
-	if err := json.Unmarshal([]byte(data), &event); err != nil {
-		return "", false, types.Usage{}, nil
+	if err := json.Unmarshal([]byte(data), &raw); err != nil {
+		return StreamEvent{}, types.Usage{}, nil
 	}
 
-	switch event.Type {
+	switch raw.Type {
 	case "response.output_text.delta":
-		return event.Delta, false, types.Usage{}, nil
+		return StreamEvent{Type: raw.Type, Delta: raw.Delta, OutputIndex: raw.OutputIndex}, types.Usage{}, nil
+	case "response.output_item.added", "response.output_item.done":
+		if raw.Item == nil || raw.Item.Type != "function_call" {
+			return StreamEvent{}, types.Usage{}, nil
+		}
+		args := raw.Item.Arguments
+		if raw.Type == "response.output_item.added" && args == "{}" {
+			args = ""
+		}
+		return StreamEvent{
+			Type:        raw.Type,
+			OutputIndex: raw.OutputIndex,
+			ToolCall: &types.ToolCall{
+				Index: intPtr(raw.OutputIndex),
+				ID:    firstNonEmpty(raw.Item.CallID, raw.Item.ID),
+				Type:  "function",
+				Function: types.ToolCallFunction{
+					Name:      raw.Item.Name,
+					Arguments: args,
+				},
+			},
+		}, types.Usage{}, nil
+	case "response.function_call_arguments.delta":
+		return StreamEvent{
+			Type:        raw.Type,
+			OutputIndex: raw.OutputIndex,
+			ToolCall: &types.ToolCall{
+				Index: intPtr(raw.OutputIndex),
+				ID:    raw.ItemID,
+				Type:  "function",
+				Function: types.ToolCallFunction{
+					Arguments: raw.Delta,
+				},
+			},
+		}, types.Usage{}, nil
 	case "response.completed":
-		if event.Response != nil && event.Response.Usage != nil {
+		usage := types.Usage{}
+		if raw.Response != nil && raw.Response.Usage != nil {
 			usage = types.Usage{
-				PromptTokens:     event.Response.Usage.InputTokens,
-				CompletionTokens: event.Response.Usage.OutputTokens,
-				TotalTokens:      event.Response.Usage.TotalTokens,
+				PromptTokens:     raw.Response.Usage.InputTokens,
+				CompletionTokens: raw.Response.Usage.OutputTokens,
+				TotalTokens:      raw.Response.Usage.TotalTokens,
 			}
 		}
-		return "", true, usage, nil
+		return StreamEvent{Type: raw.Type, Done: true}, usage, nil
 	case "response.failed", "response.error", "error":
-		if event.Error != nil && event.Error.Code == "token_expired" {
-			return "", false, types.Usage{}, ErrTokenExpired
+		if raw.Error != nil && raw.Error.Code == "token_expired" {
+			return StreamEvent{}, types.Usage{}, ErrTokenExpired
 		}
-		if event.Response != nil && event.Response.Error != nil && event.Response.Error.Code == "token_expired" {
-			return "", false, types.Usage{}, ErrTokenExpired
+		if raw.Response != nil && raw.Response.Error != nil && raw.Response.Error.Code == "token_expired" {
+			return StreamEvent{}, types.Usage{}, ErrTokenExpired
 		}
-		if event.Error != nil && event.Error.Message != "" {
-			return "", false, types.Usage{}, markTransientIfRetryableMessage(errors.New(event.Error.Message))
+		if raw.Error != nil && raw.Error.Message != "" {
+			return StreamEvent{}, types.Usage{}, markTransientIfRetryableMessage(errors.New(raw.Error.Message))
 		}
-		if event.Response != nil && event.Response.Error != nil && event.Response.Error.Message != "" {
-			return "", false, types.Usage{}, markTransientIfRetryableMessage(errors.New(event.Response.Error.Message))
+		if raw.Response != nil && raw.Response.Error != nil && raw.Response.Error.Message != "" {
+			return StreamEvent{}, types.Usage{}, markTransientIfRetryableMessage(errors.New(raw.Response.Error.Message))
 		}
-		return "", false, types.Usage{}, markTransientIfRetryableMessage(fmt.Errorf("upstream error: %s", event.Type))
+		return StreamEvent{}, types.Usage{}, markTransientIfRetryableMessage(fmt.Errorf("upstream error: %s", raw.Type))
 	default:
-		return "", false, types.Usage{}, nil
+		return StreamEvent{}, types.Usage{}, nil
 	}
+}
+
+func intPtr(v int) *int {
+	return &v
+}
+
+func upsertToolCall(calls []types.ToolCall, call types.ToolCall) []types.ToolCall {
+	if strings.TrimSpace(call.Type) == "" {
+		call.Type = "function"
+	}
+	if strings.TrimSpace(call.Function.Arguments) == "" {
+		call.Function.Arguments = "{}"
+	}
+	for i := range calls {
+		if sameToolCall(calls[i], call) {
+			if call.Function.Name != "" {
+				calls[i].Function.Name = call.Function.Name
+			}
+			if call.Function.Arguments != "" && call.Function.Arguments != "{}" {
+				calls[i].Function.Arguments += call.Function.Arguments
+			}
+			return calls
+		}
+	}
+	return append(calls, call)
+}
+
+func sameToolCall(a, b types.ToolCall) bool {
+	if a.Index != nil && b.Index != nil {
+		return *a.Index == *b.Index
+	}
+	return a.ID != "" && a.ID == b.ID
 }

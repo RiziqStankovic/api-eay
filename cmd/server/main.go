@@ -31,6 +31,7 @@ func main() {
 		TokenExpiresAt:      parseUnixMillisEnv(os.Getenv("CUSTOMAI_TOKEN_EXPIRES_AT")),
 		RefreshBuffer:       parseDurationSeconds(os.Getenv("CUSTOMAI_REFRESH_BUFFER_SECONDS"), 300),
 		TokenStorePath:      strings.TrimSpace(getEnv("CUSTOMAI_TOKEN_STORE_PATH", ".customai-tokens.json")),
+		TokenProfile:        strings.TrimSpace(os.Getenv("CUSTOMAI_TOKEN_PROFILE")),
 		Cookie:              strings.TrimSpace(os.Getenv("CUSTOMAI_COOKIE")),
 		RequestTTL:          parseDurationSeconds(os.Getenv("CUSTOMAI_TIMEOUT"), 180),
 		DefaultInstructions: strings.TrimSpace(getEnv("CUSTOMAI_DEFAULT_INSTRUCTIONS", "You are a helpful coding assistant.")),

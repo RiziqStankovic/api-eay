@@ -21,6 +21,10 @@ type MessageContentPart struct {
 func (c *MessageContent) UnmarshalJSON(data []byte) error {
 	*c = MessageContent{}
 
+	if strings.TrimSpace(string(data)) == "null" {
+		return nil
+	}
+
 	var s string
 	if err := json.Unmarshal(data, &s); err == nil {
 		c.Text = s
@@ -182,25 +186,31 @@ func hasImagePart(parts []MessageContentPart) bool {
 // ChatCompletionRequest is a minimal subset of the OpenAI Chat Completions API
 // compatible with what OpenClaw expects for provider api=openai-completions.
 type ChatCompletionRequest struct {
-	Model            string                  `json:"model"`
-	Messages         []ChatCompletionMessage `json:"messages"`
-	Stream           bool                    `json:"stream,omitempty"`
-	Temperature      *float32                `json:"temperature,omitempty"`
-	MaxTokens        *int                    `json:"max_tokens,omitempty"`
-	TopP             *float32                `json:"top_p,omitempty"`
-	FrequencyPenalty *float32                `json:"frequency_penalty,omitempty"`
-	PresencePenalty  *float32                `json:"presence_penalty,omitempty"`
+	Model             string                  `json:"model"`
+	Messages          []ChatCompletionMessage `json:"messages"`
+	Stream            bool                    `json:"stream,omitempty"`
+	Temperature       *float32                `json:"temperature,omitempty"`
+	MaxTokens         *int                    `json:"max_tokens,omitempty"`
+	TopP              *float32                `json:"top_p,omitempty"`
+	FrequencyPenalty  *float32                `json:"frequency_penalty,omitempty"`
+	PresencePenalty   *float32                `json:"presence_penalty,omitempty"`
+	Tools             []ToolDefinition        `json:"tools,omitempty"`
+	ToolChoice        any                     `json:"tool_choice,omitempty"`
+	ParallelToolCalls *bool                   `json:"parallel_tool_calls,omitempty"`
 	// Extra fields are ignored for now.
 }
 
 // AltChatRequest is an alternate body format (e.g. instructions + input array).
 // Used when the client sends { "instructions", "input" } instead of "messages".
 type AltChatRequest struct {
-	Model        string         `json:"model"`
-	Instructions string         `json:"instructions,omitempty"`
-	Input        []AltInputItem `json:"input,omitempty"`
-	Stream       bool           `json:"stream,omitempty"`
-	Store        bool           `json:"store,omitempty"`
+	Model             string           `json:"model"`
+	Instructions      string           `json:"instructions,omitempty"`
+	Input             []AltInputItem   `json:"input,omitempty"`
+	Stream            bool             `json:"stream,omitempty"`
+	Store             bool             `json:"store,omitempty"`
+	Tools             []ToolDefinition `json:"tools,omitempty"`
+	ToolChoice        any              `json:"tool_choice,omitempty"`
+	ParallelToolCalls *bool            `json:"parallel_tool_calls,omitempty"`
 }
 
 // AltInputItem is one entry in the "input" array (type "message" with role + content).
@@ -229,15 +239,47 @@ func (a AltChatRequest) ToChatCompletionRequest() ChatCompletionRequest {
 		messages = append(messages, ChatCompletionMessage{Role: item.Role, Content: item.Content})
 	}
 	return ChatCompletionRequest{
-		Model:    a.Model,
-		Messages: messages,
-		Stream:   a.Stream,
+		Model:             a.Model,
+		Messages:          messages,
+		Stream:            a.Stream,
+		Tools:             a.Tools,
+		ToolChoice:        a.ToolChoice,
+		ParallelToolCalls: a.ParallelToolCalls,
 	}
 }
 
 type ChatCompletionMessage struct {
-	Role    string         `json:"role"`
-	Content MessageContent `json:"content"`
+	Role       string         `json:"role"`
+	Content    MessageContent `json:"content"`
+	Name       string         `json:"name,omitempty"`
+	ToolCallID string         `json:"tool_call_id,omitempty"`
+	ToolCalls  []ToolCall     `json:"tool_calls,omitempty"`
+}
+
+type ToolDefinition struct {
+	Type        string       `json:"type"`
+	Function    ToolFunction `json:"function,omitempty"`
+	Name        string       `json:"name,omitempty"`
+	Description string       `json:"description,omitempty"`
+	Parameters  any          `json:"parameters,omitempty"`
+}
+
+type ToolFunction struct {
+	Name        string `json:"name"`
+	Description string `json:"description,omitempty"`
+	Parameters  any    `json:"parameters,omitempty"`
+}
+
+type ToolCall struct {
+	Index    *int             `json:"index,omitempty"`
+	ID       string           `json:"id,omitempty"`
+	Type     string           `json:"type,omitempty"`
+	Function ToolCallFunction `json:"function"`
+}
+
+type ToolCallFunction struct {
+	Name      string `json:"name,omitempty"`
+	Arguments string `json:"arguments,omitempty"`
 }
 
 // ChatCompletionResponse mirrors the non-streaming OpenAI response shape.
@@ -279,8 +321,9 @@ type ChatCompletionStreamChunkChoice struct {
 }
 
 type ChatCompletionStreamChunkDelta struct {
-	Role    string `json:"role,omitempty"`
-	Content string `json:"content,omitempty"`
+	Role      string     `json:"role,omitempty"`
+	Content   string     `json:"content,omitempty"`
+	ToolCalls []ToolCall `json:"tool_calls,omitempty"`
 }
 
 // ErrorResponse is a minimal OpenAI-compatible error envelope.

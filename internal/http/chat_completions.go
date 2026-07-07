@@ -10,6 +10,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -27,12 +28,15 @@ func NewChatCompletionsHandler(c cursor.Client) http.Handler {
 }
 
 type chatRequestBody struct {
-	Model        string                        `json:"model"`
-	Messages     []types.ChatCompletionMessage `json:"messages"`
-	Stream       bool                          `json:"stream,omitempty"`
-	Instructions string                        `json:"instructions,omitempty"`
-	Input        []types.AltInputItem          `json:"input,omitempty"`
-	Store        bool                          `json:"store,omitempty"`
+	Model             string                        `json:"model"`
+	Messages          []types.ChatCompletionMessage `json:"messages"`
+	Stream            bool                          `json:"stream,omitempty"`
+	Instructions      string                        `json:"instructions,omitempty"`
+	Input             []types.AltInputItem          `json:"input,omitempty"`
+	Store             bool                          `json:"store,omitempty"`
+	Tools             []types.ToolDefinition        `json:"tools,omitempty"`
+	ToolChoice        any                           `json:"tool_choice,omitempty"`
+	ParallelToolCalls *bool                         `json:"parallel_tool_calls,omitempty"`
 }
 
 func normalizeRequest(raw *chatRequestBody) (types.ChatCompletionRequest, bool) {
@@ -40,9 +44,24 @@ func normalizeRequest(raw *chatRequestBody) (types.ChatCompletionRequest, bool) 
 		return types.ChatCompletionRequest{}, false
 	}
 	if len(raw.Messages) > 0 {
-		return types.ChatCompletionRequest{Model: raw.Model, Messages: raw.Messages, Stream: raw.Stream}, true
+		return types.ChatCompletionRequest{
+			Model:             raw.Model,
+			Messages:          raw.Messages,
+			Stream:            raw.Stream,
+			Tools:             raw.Tools,
+			ToolChoice:        raw.ToolChoice,
+			ParallelToolCalls: raw.ParallelToolCalls,
+		}, true
 	}
-	alt := types.AltChatRequest{Model: raw.Model, Instructions: raw.Instructions, Input: raw.Input, Stream: raw.Stream}
+	alt := types.AltChatRequest{
+		Model:             raw.Model,
+		Instructions:      raw.Instructions,
+		Input:             raw.Input,
+		Stream:            raw.Stream,
+		Tools:             raw.Tools,
+		ToolChoice:        raw.ToolChoice,
+		ParallelToolCalls: raw.ParallelToolCalls,
+	}
 	return alt.ToChatCompletionRequest(), true
 }
 
@@ -134,7 +153,41 @@ func (h *ChatCompletionsHandler) handleStream(ctx context.Context, w http.Respon
 	chunkID := "chatcmpl-" + randomID()
 	created := time.Now().Unix()
 
-	_, err := h.customClient.ChatCompletionStream(ctx, req, func(delta string) error {
+	wroteToolCall := false
+	toolCallBuffers := map[string]types.ToolCall{}
+	_, err := h.customClient.ResponsesStream(ctx, req, func(event cursor.StreamEvent) error {
+		delta := types.ChatCompletionStreamChunkDelta{}
+		if event.Delta != "" {
+			delta.Content = event.Delta
+		}
+		if event.ToolCall != nil {
+			wroteToolCall = true
+			toolCall := *event.ToolCall
+			if toolCall.Type == "" {
+				toolCall.Type = "function"
+			}
+			if toolCall.Index == nil {
+				toolCall.Index = intPtr(0)
+			}
+			toolKey := toolCallStreamKey(toolCall)
+			buffered := toolCallBuffers[toolKey]
+			if event.Type == "response.output_item.done" && buffered.Function.Arguments != "" {
+				toolCall.Function.Arguments = ""
+			}
+			buffered = mergeBufferedToolCall(buffered, toolCall)
+			toolCallBuffers[toolKey] = buffered
+			switch event.Type {
+			case "response.output_item.done":
+				delta.ToolCalls = []types.ToolCall{buffered}
+				delete(toolCallBuffers, toolKey)
+			default:
+				// Zed/ACP executes tool calls from the streamed chunk it sees.
+				// Buffer partial added/arguments events so it receives one complete call.
+			}
+		}
+		if delta.Content == "" && len(delta.ToolCalls) == 0 {
+			return nil
+		}
 		chunk := types.ChatCompletionStreamChunk{
 			ID:      chunkID,
 			Object:  "chat.completion.chunk",
@@ -143,7 +196,7 @@ func (h *ChatCompletionsHandler) handleStream(ctx context.Context, w http.Respon
 			Choices: []types.ChatCompletionStreamChunkChoice{
 				{
 					Index: 0,
-					Delta: types.ChatCompletionStreamChunkDelta{Content: delta},
+					Delta: delta,
 				},
 			},
 		}
@@ -169,6 +222,9 @@ func (h *ChatCompletionsHandler) handleStream(ctx context.Context, w http.Respon
 	}
 
 	stop := "stop"
+	if wroteToolCall {
+		stop = "tool_calls"
+	}
 	finalChunk := types.ChatCompletionStreamChunk{
 		ID:      chunkID,
 		Object:  "chat.completion.chunk",
@@ -192,6 +248,35 @@ func (h *ChatCompletionsHandler) handleStream(ctx context.Context, w http.Respon
 	}
 	_ = bw.Flush()
 	flusher.Flush()
+}
+
+func toolCallStreamKey(toolCall types.ToolCall) string {
+	if toolCall.Index != nil {
+		return "index:" + strconv.Itoa(*toolCall.Index)
+	}
+	if strings.TrimSpace(toolCall.ID) != "" {
+		return strings.TrimSpace(toolCall.ID)
+	}
+	return "index:0"
+}
+
+func mergeBufferedToolCall(dst, src types.ToolCall) types.ToolCall {
+	if dst.Index == nil {
+		dst.Index = src.Index
+	}
+	if dst.ID == "" {
+		dst.ID = src.ID
+	}
+	if dst.Type == "" {
+		dst.Type = firstNonEmpty(src.Type, "function")
+	}
+	if src.Function.Name != "" {
+		dst.Function.Name = src.Function.Name
+	}
+	if src.Function.Arguments != "" {
+		dst.Function.Arguments += src.Function.Arguments
+	}
+	return dst
 }
 
 func (h *ChatCompletionsHandler) handleResponsesNonStream(ctx context.Context, w http.ResponseWriter, req types.ChatCompletionRequest) {
@@ -243,6 +328,12 @@ func (h *ChatCompletionsHandler) handleResponsesNonStream(ctx context.Context, w
 }
 
 func (h *ChatCompletionsHandler) handleResponsesStream(ctx context.Context, w http.ResponseWriter, req types.ChatCompletionRequest) {
+	if err := h.customClient.PreflightAuth(ctx); err != nil {
+		log.Printf("customai Responses preflight auth error request_id=%s: %v", requestid.FromContext(ctx), err)
+		writeErrorWithCode(w, http.StatusBadGateway, err.Error(), inferResponsesErrorCode(err.Error()))
+		return
+	}
+
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		writeError(w, http.StatusInternalServerError, "streaming not supported by server")
@@ -258,6 +349,7 @@ func (h *ChatCompletionsHandler) handleResponsesStream(ctx context.Context, w ht
 	itemID := "msg_" + randomID()
 	createdAt := time.Now().Unix()
 	var fullText strings.Builder
+	toolCalls := make([]types.ToolCall, 0)
 
 	writeEvent := func(v map[string]any) error {
 		data, err := json.Marshal(v)
@@ -309,51 +401,93 @@ func (h *ChatCompletionsHandler) handleResponsesStream(ctx context.Context, w ht
 		},
 	})
 
-	usage, err := h.customClient.ChatCompletionStream(ctx, req, func(delta string) error {
-		fullText.WriteString(delta)
-		return writeEvent(map[string]any{
-			"type":          "response.output_text.delta",
-			"delta":         delta,
-			"item_id":       itemID,
-			"output_index":  0,
-			"content_index": 0,
-		})
+	usage, err := h.customClient.ResponsesStream(ctx, req, func(event cursor.StreamEvent) error {
+		if event.Delta != "" {
+			fullText.WriteString(event.Delta)
+			return writeEvent(map[string]any{
+				"type":          "response.output_text.delta",
+				"delta":         event.Delta,
+				"item_id":       itemID,
+				"output_index":  0,
+				"content_index": 0,
+			})
+		}
+		if event.ToolCall == nil {
+			return nil
+		}
+		toolCall := *event.ToolCall
+		if toolCall.ID == "" {
+			toolCall.ID = "call_" + randomID()
+		}
+		if toolCall.Type == "" {
+			toolCall.Type = "function"
+		}
+		toolCalls = upsertResponseToolCall(toolCalls, toolCall)
+		callIndex := len(toolCalls)
+		switch event.Type {
+		case "response.function_call_arguments.delta":
+			return writeEvent(map[string]any{
+				"type":         "response.function_call_arguments.delta",
+				"item_id":      toolCall.ID,
+				"output_index": callIndex,
+				"delta":        toolCall.Function.Arguments,
+			})
+		default:
+			return writeEvent(map[string]any{
+				"type":         "response.output_item.added",
+				"output_index": callIndex,
+				"item": map[string]any{
+					"id":        toolCall.ID,
+					"type":      "function_call",
+					"call_id":   toolCall.ID,
+					"name":      toolCall.Function.Name,
+					"arguments": toolCall.Function.Arguments,
+					"status":    "completed",
+				},
+			})
+		}
 	})
 	if err != nil {
 		log.Printf("customai Responses stream error request_id=%s: %v", requestid.FromContext(ctx), err)
-		_ = writeEvent(map[string]any{
-			"type": "error",
-			"error": map[string]any{
-				"message": err.Error(),
-			},
-		})
+		_ = writeEvent(buildResponsesErrorEvent(err))
 	} else {
+		output := []any{
+			map[string]any{
+				"id":     itemID,
+				"type":   "message",
+				"status": "completed",
+				"role":   "assistant",
+				"content": []any{
+					map[string]any{
+						"type":        "output_text",
+						"text":        fullText.String(),
+						"annotations": []any{},
+					},
+				},
+			},
+		}
+		for _, toolCall := range toolCalls {
+			output = append(output, map[string]any{
+				"id":        toolCall.ID,
+				"type":      "function_call",
+				"call_id":   toolCall.ID,
+				"name":      toolCall.Function.Name,
+				"arguments": firstNonEmpty(toolCall.Function.Arguments, "{}"),
+				"status":    "completed",
+			})
+		}
 		_ = writeEvent(map[string]any{
 			"type": "response.completed",
 			"response": map[string]any{
-				"id":         respID,
-				"object":     "response",
-				"created_at": createdAt,
-				"status":     "completed",
-				"model":      req.Model,
-				"output": []any{
-					map[string]any{
-						"id":     itemID,
-						"type":   "message",
-						"status": "completed",
-						"role":   "assistant",
-						"content": []any{
-							map[string]any{
-								"type":        "output_text",
-								"text":        fullText.String(),
-								"annotations": []any{},
-							},
-						},
-					},
-				},
+				"id":                  respID,
+				"object":              "response",
+				"created_at":          createdAt,
+				"status":              "completed",
+				"model":               req.Model,
+				"output":              output,
 				"parallel_tool_calls": true,
 				"tool_choice":         "auto",
-				"tools":               []any{},
+				"tools":               responseTools(req.Tools),
 				"top_p":               1.0,
 				"usage": map[string]any{
 					"input_tokens":  usage.PromptTokens,
@@ -371,6 +505,106 @@ func (h *ChatCompletionsHandler) handleResponsesStream(ctx context.Context, w ht
 	flusher.Flush()
 }
 
+func upsertResponseToolCall(calls []types.ToolCall, call types.ToolCall) []types.ToolCall {
+	for i := range calls {
+		if sameResponseToolCall(calls[i], call) {
+			if call.Function.Name != "" {
+				calls[i].Function.Name = call.Function.Name
+			}
+			if call.Function.Arguments != "" && call.Function.Arguments != "{}" {
+				calls[i].Function.Arguments += call.Function.Arguments
+			}
+			return calls
+		}
+	}
+	return append(calls, call)
+}
+
+func sameResponseToolCall(a, b types.ToolCall) bool {
+	if a.Index != nil && b.Index != nil {
+		return *a.Index == *b.Index
+	}
+	return a.ID != "" && a.ID == b.ID
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if trimmed := strings.TrimSpace(value); trimmed != "" {
+			return trimmed
+		}
+	}
+	return ""
+}
+
+func intPtr(v int) *int {
+	return &v
+}
+
+func responseTools(tools []types.ToolDefinition) []any {
+	if len(tools) == 0 {
+		return []any{}
+	}
+	out := make([]any, 0, len(tools))
+	for _, tool := range tools {
+		name := strings.TrimSpace(tool.Name)
+		description := tool.Description
+		parameters := tool.Parameters
+		if name == "" && strings.TrimSpace(tool.Function.Name) != "" {
+			name = strings.TrimSpace(tool.Function.Name)
+			description = tool.Function.Description
+			parameters = tool.Function.Parameters
+		}
+		if name == "" {
+			continue
+		}
+		out = append(out, map[string]any{
+			"type":        firstNonEmpty(tool.Type, "function"),
+			"name":        name,
+			"description": description,
+			"parameters":  parameters,
+		})
+	}
+	if out == nil {
+		return []any{}
+	}
+	return out
+}
+
+func buildResponsesErrorEvent(err error) map[string]any {
+	message := "unknown error"
+	if err != nil {
+		message = err.Error()
+	}
+	code := inferResponsesErrorCode(message)
+	return map[string]any{
+		"type":    "error",
+		"code":    code,
+		"message": message,
+		"param":   nil,
+		"error": map[string]any{
+			"code":    code,
+			"message": message,
+			"param":   nil,
+		},
+	}
+}
+
+func inferResponsesErrorCode(message string) string {
+	msg := strings.ToLower(strings.TrimSpace(message))
+	switch {
+	case strings.Contains(msg, "invalid_client"):
+		return "invalid_client"
+	case strings.Contains(msg, "refresh_token_reused"):
+		return "invalid_client"
+	case strings.Contains(msg, "token expired"), strings.Contains(msg, "token_expired"):
+		return "token_expired"
+	case strings.Contains(msg, "context deadline exceeded"), strings.Contains(msg, "timeout"):
+		return "timeout"
+	default:
+		return "gateway_error"
+	}
+}
+
 func randomID() string {
 	b := make([]byte, 12)
 	if _, err := rand.Read(b); err != nil {
@@ -380,10 +614,14 @@ func randomID() string {
 }
 
 func writeError(w http.ResponseWriter, status int, msg string) {
+	writeErrorWithCode(w, status, msg, "")
+}
+
+func writeErrorWithCode(w http.ResponseWriter, status int, msg, code string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(types.ErrorResponse{
-		Error: types.ErrorBody{Message: msg, Type: "customai-gateway-error"},
+		Error: types.ErrorBody{Message: msg, Type: "customai-gateway-error", Code: code},
 	})
 }
 
