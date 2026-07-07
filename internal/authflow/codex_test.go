@@ -64,6 +64,38 @@ func TestSaveTokensMergesAuthProfiles(t *testing.T) {
 	}
 }
 
+func TestParseCallbackInputAcceptsFullCallbackURL(t *testing.T) {
+	result, err := parseCallbackInput("http://localhost:1455/auth/callback?code=ac_123&scope=openid+profile&state=state_123")
+	if err != nil {
+		t.Fatalf("parse callback: %v", err)
+	}
+	if got, want := result.code, "ac_123"; got != want {
+		t.Fatalf("code = %q, want %q", got, want)
+	}
+	if got, want := result.state, "state_123"; got != want {
+		t.Fatalf("state = %q, want %q", got, want)
+	}
+}
+
+func TestParseCallbackInputAcceptsQueryString(t *testing.T) {
+	result, err := parseCallbackInput("?code=ac_456&state=state_456")
+	if err != nil {
+		t.Fatalf("parse callback: %v", err)
+	}
+	if got, want := result.code, "ac_456"; got != want {
+		t.Fatalf("code = %q, want %q", got, want)
+	}
+	if got, want := result.state, "state_456"; got != want {
+		t.Fatalf("state = %q, want %q", got, want)
+	}
+}
+
+func TestParseCallbackInputRejectsMissingState(t *testing.T) {
+	if _, err := parseCallbackInput("http://localhost:1455/auth/callback?code=ac_123"); err == nil {
+		t.Fatal("expected missing state error")
+	}
+}
+
 func jwt(payload map[string]any) string {
 	header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"none"}`))
 	body, _ := json.Marshal(payload)

@@ -119,6 +119,8 @@ Jika browser tidak bisa dibuka otomatis, pakai:
 go run ./cmd/auth -store auth-profiles.json -profile user@example.com -open-browser=false
 ```
 
+Jika login berhasil di browser tetapi callback `localhost` tidak sampai ke terminal, copy URL callback penuh dari address bar, misalnya `http://localhost:1455/auth/callback?code=...&state=...`, lalu paste ke terminal yang sedang menjalankan `cmd/auth` dan tekan Enter. Fallback paste ini aktif default; bisa dimatikan dengan `-paste-callback=false`.
+
 Contoh Request
 --------------
 

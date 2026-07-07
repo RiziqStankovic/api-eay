@@ -1,6 +1,7 @@
 package authflow
 
 import (
+	"bufio"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -27,14 +28,16 @@ const (
 )
 
 type Options struct {
-	StorePath    string
-	Profile      string
-	ClientID     string
-	Scope        string
-	Originator   string
-	CallbackPort int
-	OpenBrowser  bool
-	Timeout      time.Duration
+	StorePath     string
+	Profile       string
+	ClientID      string
+	Scope         string
+	Originator    string
+	CallbackPort  int
+	OpenBrowser   bool
+	Timeout       time.Duration
+	PasteCallback bool
+	CallbackInput io.Reader
 }
 
 type ProfileStore struct {
@@ -118,6 +121,10 @@ func Login(ctx context.Context, opts Options) (string, error) {
 	defer server.Shutdown(context.Background())
 
 	fmt.Printf("Open this URL to login:\n\n%s\n\n", authURL)
+	if opts.PasteCallback {
+		fmt.Printf("If the browser callback does not trigger, paste the full callback URL here and press Enter.\n\n")
+		go readPastedCallback(opts.CallbackInput, resultCh)
+	}
 	if opts.OpenBrowser {
 		_ = openBrowser(authURL)
 	}
@@ -171,7 +178,69 @@ func normalizeOptions(opts Options) Options {
 	if opts.Timeout <= 0 {
 		opts.Timeout = 5 * time.Minute
 	}
+	if opts.CallbackInput == nil {
+		opts.CallbackInput = os.Stdin
+	}
 	return opts
+}
+
+func readPastedCallback(input io.Reader, resultCh chan<- callbackResult) {
+	scanner := bufio.NewScanner(input)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+		result, err := parseCallbackInput(line)
+		if err != nil {
+			fmt.Printf("Invalid callback URL: %v\nPaste the full callback URL again, or wait for browser callback.\n\n", err)
+			continue
+		}
+		select {
+		case resultCh <- result:
+		default:
+		}
+		return
+	}
+}
+
+func parseCallbackInput(input string) (callbackResult, error) {
+	input = strings.TrimSpace(input)
+	if input == "" {
+		return callbackResult{}, fmt.Errorf("empty callback input")
+	}
+
+	var values url.Values
+	if strings.HasPrefix(input, "http://") || strings.HasPrefix(input, "https://") {
+		u, err := url.Parse(input)
+		if err != nil {
+			return callbackResult{}, err
+		}
+		if !strings.HasSuffix(u.Path, "/auth/callback") {
+			return callbackResult{}, fmt.Errorf("URL path %q is not /auth/callback", u.Path)
+		}
+		values = u.Query()
+	} else {
+		input = strings.TrimPrefix(input, "?")
+		parsed, err := url.ParseQuery(input)
+		if err != nil {
+			return callbackResult{}, err
+		}
+		values = parsed
+	}
+
+	result := callbackResult{
+		code:  strings.TrimSpace(values.Get("code")),
+		state: strings.TrimSpace(values.Get("state")),
+		err:   strings.TrimSpace(values.Get("error")),
+	}
+	if result.err == "" && result.code == "" {
+		return callbackResult{}, fmt.Errorf("missing code")
+	}
+	if result.state == "" {
+		return callbackResult{}, fmt.Errorf("missing state")
+	}
+	return result, nil
 }
 
 func listenCallback(preferredPort int) (net.Listener, int, error) {
