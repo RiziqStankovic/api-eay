@@ -318,3 +318,76 @@ func TestHandleChatCompletionsStreamDoesNotDuplicateArgumentsWhenItemIDDiffers(t
 		t.Fatalf("arguments chunk count = %d, want %d; body=%q", got, want, body)
 	}
 }
+
+func TestHandleChatCompletionsStreamWritesReasoningContent(t *testing.T) {
+	client := &fakeClient{
+		responsesEvents: []cursor.StreamEvent{
+			{
+				Type:           "response.reasoning_summary_text.delta",
+				ReasoningDelta: "Checking the repo first.",
+			},
+		},
+	}
+	handler := NewChatCompletionsHandler(client)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{
+		"model":"gpt-5.4-mini",
+		"messages":[{"role":"user","content":"cek"}],
+		"stream":true
+	}`))
+	rec := httptest.NewRecorder()
+
+	handler.ServeHTTP(rec, req)
+
+	if got, want := rec.Code, http.StatusOK; got != want {
+		t.Fatalf("status = %d, want %d", got, want)
+	}
+	body := rec.Body.String()
+	for _, want := range []string{`"reasoning_content":"Checking the repo first."`, `"finish_reason":"stop"`} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("body %q does not contain %q", body, want)
+		}
+	}
+}
+
+func TestNormalizeToolArgumentsCleansDiagnosticsNullPath(t *testing.T) {
+	cases := []string{
+		`null`,
+		`{"path":null}`,
+		`{"path":"null"}`,
+		`{"path":".null"}`,
+		`{"path":"/"}`,
+		`{"path":"auto-repo-xl"}`,
+		`{"path":"D:\\xl\\auto-repo-xl"}`,
+		`{"path":"D:\\xl\\auto-repo-xl\\shared-lib-apps"}`,
+		`{"directory":"D:\\xl\\auto-repo-xl"}`,
+	}
+
+	for _, raw := range cases {
+		if got, want := normalizeToolArguments("diagnostics", raw), `{}`; got != want {
+			t.Fatalf("normalize diagnostics %s = %s, want %s", raw, got, want)
+		}
+	}
+}
+
+func TestNormalizeToolArgumentsKeepsValidFilePath(t *testing.T) {
+	got := normalizeToolArguments("diagnostics", `{"path":"D:\\xl\\auto-repo-xl\\package.json"}`)
+	if !strings.Contains(got, `D:\\xl\\auto-repo-xl\\package.json`) {
+		t.Fatalf("normalized args = %s, want path preserved", got)
+	}
+}
+
+func TestNormalizeToolArgumentsMakesFindPathGlobWorkspaceRelative(t *testing.T) {
+	got := normalizeToolArguments("find_path", `{"glob":"D:\\xl\\auto-repo-xl/**/README*","offset":0}`)
+	for _, want := range []string{`"glob":"auto-repo-xl/**/README*"`, `"offset":0`} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("normalized args = %s, want %s", got, want)
+		}
+	}
+}
+
+func TestNormalizeFindPathGlobKeepsRelativeGlob(t *testing.T) {
+	if got, want := normalizeFindPathGlob(`auto-repo-xl/**/README*`), `auto-repo-xl/**/README*`; got != want {
+		t.Fatalf("normalizeFindPathGlob = %q, want %q", got, want)
+	}
+}

@@ -37,6 +37,9 @@ type chatRequestBody struct {
 	Tools             []types.ToolDefinition        `json:"tools,omitempty"`
 	ToolChoice        any                           `json:"tool_choice,omitempty"`
 	ParallelToolCalls *bool                         `json:"parallel_tool_calls,omitempty"`
+	Reasoning         any                           `json:"reasoning,omitempty"`
+	ReasoningEffort   string                        `json:"reasoning_effort,omitempty"`
+	Thinking          any                           `json:"thinking,omitempty"`
 }
 
 func normalizeRequest(raw *chatRequestBody) (types.ChatCompletionRequest, bool) {
@@ -51,6 +54,9 @@ func normalizeRequest(raw *chatRequestBody) (types.ChatCompletionRequest, bool) 
 			Tools:             raw.Tools,
 			ToolChoice:        raw.ToolChoice,
 			ParallelToolCalls: raw.ParallelToolCalls,
+			Reasoning:         raw.Reasoning,
+			ReasoningEffort:   raw.ReasoningEffort,
+			Thinking:          raw.Thinking,
 		}, true
 	}
 	alt := types.AltChatRequest{
@@ -61,6 +67,9 @@ func normalizeRequest(raw *chatRequestBody) (types.ChatCompletionRequest, bool) 
 		Tools:             raw.Tools,
 		ToolChoice:        raw.ToolChoice,
 		ParallelToolCalls: raw.ParallelToolCalls,
+		Reasoning:         raw.Reasoning,
+		ReasoningEffort:   raw.ReasoningEffort,
+		Thinking:          raw.Thinking,
 	}
 	return alt.ToChatCompletionRequest(), true
 }
@@ -160,6 +169,9 @@ func (h *ChatCompletionsHandler) handleStream(ctx context.Context, w http.Respon
 		if event.Delta != "" {
 			delta.Content = event.Delta
 		}
+		if event.ReasoningDelta != "" {
+			delta.ReasoningContent = event.ReasoningDelta
+		}
 		if event.ToolCall != nil {
 			wroteToolCall = true
 			toolCall := *event.ToolCall
@@ -178,6 +190,7 @@ func (h *ChatCompletionsHandler) handleStream(ctx context.Context, w http.Respon
 			toolCallBuffers[toolKey] = buffered
 			switch event.Type {
 			case "response.output_item.done":
+				buffered.Function.Arguments = normalizeToolArguments(buffered.Function.Name, buffered.Function.Arguments)
 				delta.ToolCalls = []types.ToolCall{buffered}
 				delete(toolCallBuffers, toolKey)
 			default:
@@ -185,7 +198,7 @@ func (h *ChatCompletionsHandler) handleStream(ctx context.Context, w http.Respon
 				// Buffer partial added/arguments events so it receives one complete call.
 			}
 		}
-		if delta.Content == "" && len(delta.ToolCalls) == 0 {
+		if delta.Content == "" && delta.ReasoningContent == "" && len(delta.ToolCalls) == 0 {
 			return nil
 		}
 		chunk := types.ChatCompletionStreamChunk{
@@ -277,6 +290,146 @@ func mergeBufferedToolCall(dst, src types.ToolCall) types.ToolCall {
 		dst.Function.Arguments += src.Function.Arguments
 	}
 	return dst
+}
+
+func normalizeToolArguments(toolName, raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" || raw == "null" {
+		return "{}"
+	}
+
+	var value any
+	if err := json.Unmarshal([]byte(raw), &value); err != nil {
+		return raw
+	}
+	cleaned := cleanToolArgumentValue(value)
+	if cleaned == nil {
+		return "{}"
+	}
+	if obj, ok := cleaned.(map[string]any); ok {
+		cleanToolArgumentObject(strings.TrimSpace(toolName), obj)
+		if len(obj) == 0 {
+			return "{}"
+		}
+		cleaned = obj
+	}
+	data, err := json.Marshal(cleaned)
+	if err != nil {
+		return raw
+	}
+	return string(data)
+}
+
+func cleanToolArgumentValue(value any) any {
+	switch v := value.(type) {
+	case nil:
+		return nil
+	case map[string]any:
+		out := make(map[string]any, len(v))
+		for key, child := range v {
+			cleaned := cleanToolArgumentValue(child)
+			if cleaned == nil {
+				continue
+			}
+			out[key] = cleaned
+		}
+		return out
+	case []any:
+		out := make([]any, 0, len(v))
+		for _, child := range v {
+			cleaned := cleanToolArgumentValue(child)
+			if cleaned != nil {
+				out = append(out, cleaned)
+			}
+		}
+		return out
+	case string:
+		trimmed := strings.TrimSpace(v)
+		if trimmed == "" || strings.EqualFold(trimmed, "null") || strings.EqualFold(trimmed, ".null") {
+			return nil
+		}
+		return v
+	default:
+		return v
+	}
+}
+
+func cleanToolArgumentObject(toolName string, obj map[string]any) {
+	switch toolName {
+	case "find_path":
+		if glob, ok := obj["glob"].(string); ok {
+			if normalized := normalizeFindPathGlob(glob); normalized != "" {
+				obj["glob"] = normalized
+			}
+		}
+	case "diagnostics":
+		delete(obj, "directory")
+		for _, key := range []string{"path", "file"} {
+			if isBadDiagnosticsPath(obj[key]) {
+				delete(obj, key)
+			}
+		}
+	}
+}
+
+func normalizeFindPathGlob(raw string) string {
+	glob := strings.TrimSpace(strings.ReplaceAll(raw, `\`, `/`))
+	if glob == "" {
+		return ""
+	}
+	wildcard := strings.IndexAny(glob, "*?[")
+	if wildcard < 0 {
+		return strings.TrimPrefix(glob, "./")
+	}
+
+	prefix := strings.TrimRight(glob[:wildcard], "/")
+	suffix := glob[wildcard:]
+	if !isAbsoluteLikePath(prefix) {
+		return strings.TrimPrefix(glob, "./")
+	}
+
+	parts := strings.Split(prefix, "/")
+	for i := len(parts) - 1; i >= 0; i-- {
+		part := strings.TrimSpace(parts[i])
+		if part == "" || strings.HasSuffix(part, ":") {
+			continue
+		}
+		return part + "/" + suffix
+	}
+	return strings.TrimPrefix(glob, "./")
+}
+
+func isAbsoluteLikePath(path string) bool {
+	path = strings.TrimSpace(path)
+	return strings.HasPrefix(path, "/") ||
+		(len(path) >= 2 && path[1] == ':') ||
+		strings.HasPrefix(path, "//")
+}
+
+func isBadDiagnosticsPath(value any) bool {
+	s, ok := value.(string)
+	if !ok {
+		return false
+	}
+	trimmed := strings.TrimSpace(s)
+	return trimmed == "" ||
+		trimmed == "/" ||
+		strings.EqualFold(trimmed, "null") ||
+		strings.EqualFold(trimmed, ".null") ||
+		!looksLikeFilePath(trimmed)
+}
+
+func looksLikeFilePath(path string) bool {
+	path = strings.TrimRight(strings.TrimSpace(path), `/\`)
+	if path == "" {
+		return false
+	}
+	lastSlash := strings.LastIndexAny(path, `/\`)
+	base := path
+	if lastSlash >= 0 {
+		base = path[lastSlash+1:]
+	}
+	return strings.Contains(base, ".")
 }
 
 func (h *ChatCompletionsHandler) handleResponsesNonStream(ctx context.Context, w http.ResponseWriter, req types.ChatCompletionRequest) {
@@ -467,6 +620,7 @@ func (h *ChatCompletionsHandler) handleResponsesStream(ctx context.Context, w ht
 			},
 		}
 		for _, toolCall := range toolCalls {
+			toolCall.Function.Arguments = normalizeToolArguments(toolCall.Function.Name, toolCall.Function.Arguments)
 			output = append(output, map[string]any{
 				"id":        toolCall.ID,
 				"type":      "function_call",

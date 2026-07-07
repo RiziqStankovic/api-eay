@@ -197,6 +197,9 @@ type ChatCompletionRequest struct {
 	Tools             []ToolDefinition        `json:"tools,omitempty"`
 	ToolChoice        any                     `json:"tool_choice,omitempty"`
 	ParallelToolCalls *bool                   `json:"parallel_tool_calls,omitempty"`
+	Reasoning         any                     `json:"reasoning,omitempty"`
+	ReasoningEffort   string                  `json:"reasoning_effort,omitempty"`
+	Thinking          any                     `json:"thinking,omitempty"`
 	// Extra fields are ignored for now.
 }
 
@@ -211,6 +214,9 @@ type AltChatRequest struct {
 	Tools             []ToolDefinition `json:"tools,omitempty"`
 	ToolChoice        any              `json:"tool_choice,omitempty"`
 	ParallelToolCalls *bool            `json:"parallel_tool_calls,omitempty"`
+	Reasoning         any              `json:"reasoning,omitempty"`
+	ReasoningEffort   string           `json:"reasoning_effort,omitempty"`
+	Thinking          any              `json:"thinking,omitempty"`
 }
 
 // AltInputItem is one entry in the "input" array (type "message" with role + content).
@@ -245,15 +251,19 @@ func (a AltChatRequest) ToChatCompletionRequest() ChatCompletionRequest {
 		Tools:             a.Tools,
 		ToolChoice:        a.ToolChoice,
 		ParallelToolCalls: a.ParallelToolCalls,
+		Reasoning:         a.Reasoning,
+		ReasoningEffort:   a.ReasoningEffort,
+		Thinking:          a.Thinking,
 	}
 }
 
 type ChatCompletionMessage struct {
-	Role       string         `json:"role"`
-	Content    MessageContent `json:"content"`
-	Name       string         `json:"name,omitempty"`
-	ToolCallID string         `json:"tool_call_id,omitempty"`
-	ToolCalls  []ToolCall     `json:"tool_calls,omitempty"`
+	Role             string         `json:"role"`
+	Content          MessageContent `json:"content"`
+	ReasoningContent string         `json:"reasoning_content,omitempty"`
+	Name             string         `json:"name,omitempty"`
+	ToolCallID       string         `json:"tool_call_id,omitempty"`
+	ToolCalls        []ToolCall     `json:"tool_calls,omitempty"`
 }
 
 type ToolDefinition struct {
@@ -321,9 +331,10 @@ type ChatCompletionStreamChunkChoice struct {
 }
 
 type ChatCompletionStreamChunkDelta struct {
-	Role      string     `json:"role,omitempty"`
-	Content   string     `json:"content,omitempty"`
-	ToolCalls []ToolCall `json:"tool_calls,omitempty"`
+	Role             string     `json:"role,omitempty"`
+	Content          string     `json:"content,omitempty"`
+	ReasoningContent string     `json:"reasoning_content,omitempty"`
+	ToolCalls        []ToolCall `json:"tool_calls,omitempty"`
 }
 
 // ErrorResponse is a minimal OpenAI-compatible error envelope.

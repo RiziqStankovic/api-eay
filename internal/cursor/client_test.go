@@ -52,6 +52,72 @@ func TestBuildUpstreamRequestPreservesImageParts(t *testing.T) {
 	}
 }
 
+func TestBuildUpstreamRequestAddsZedToolGuidance(t *testing.T) {
+	req := types.ChatCompletionRequest{
+		Model: "gpt-5.4-mini",
+		Messages: []types.ChatCompletionMessage{
+			{Role: "user", Content: types.MessageContent{Text: "cek project"}},
+		},
+		Tools: []types.ToolDefinition{
+			{
+				Type: "function",
+				Function: types.ToolFunction{
+					Name: "find_path",
+				},
+			},
+		},
+	}
+
+	upstream := buildUpstreamRequest(req, true, "You are helpful.")
+	if !strings.Contains(upstream.Instructions, "Do not repeat the same broad pattern after a \"No matches\" result") {
+		t.Fatalf("instructions missing Zed tool guidance: %s", upstream.Instructions)
+	}
+}
+
+func TestBuildUpstreamRequestMapsReasoningEffort(t *testing.T) {
+	req := types.ChatCompletionRequest{
+		Model: "gpt-5.4-mini",
+		Messages: []types.ChatCompletionMessage{
+			{Role: "user", Content: types.MessageContent{Text: "cek project"}},
+		},
+		ReasoningEffort: "Extra High",
+	}
+
+	upstream := buildUpstreamRequest(req, true, "You are helpful.")
+	reasoning, ok := upstream.Reasoning.(map[string]any)
+	if !ok {
+		t.Fatalf("reasoning = %T, want map[string]any", upstream.Reasoning)
+	}
+	if got, want := reasoning["effort"], "high"; got != want {
+		t.Fatalf("reasoning effort = %v, want %v", got, want)
+	}
+}
+
+func TestBuildUpstreamRequestKeepsReasoningObject(t *testing.T) {
+	req := types.ChatCompletionRequest{
+		Model: "gpt-5.4-mini",
+		Messages: []types.ChatCompletionMessage{
+			{Role: "user", Content: types.MessageContent{Text: "cek project"}},
+		},
+		Reasoning: map[string]any{
+			"effort":  "Medium",
+			"summary": "auto",
+		},
+	}
+
+	upstream := buildUpstreamRequest(req, true, "You are helpful.")
+	reasoning, ok := upstream.Reasoning.(map[string]any)
+	if !ok {
+		t.Fatalf("reasoning = %T, want map[string]any", upstream.Reasoning)
+	}
+	if got, want := reasoning["effort"], "medium"; got != want {
+		t.Fatalf("reasoning effort = %v, want %v", got, want)
+	}
+	if got, want := reasoning["summary"], "auto"; got != want {
+		t.Fatalf("reasoning summary = %v, want %v", got, want)
+	}
+}
+
 func TestRedactPayloadForLogRemovesImageData(t *testing.T) {
 	payload := []byte(`{
 		"input": [
@@ -126,6 +192,21 @@ func TestParseStreamDataReadsFunctionCallItem(t *testing.T) {
 	}
 	if event.ToolCall.Index == nil || *event.ToolCall.Index != 0 {
 		t.Fatalf("index = %v, want 0", event.ToolCall.Index)
+	}
+}
+
+func TestParseStreamDataReadsReasoningSummaryDelta(t *testing.T) {
+	data := `{
+		"type": "response.reasoning_summary_text.delta",
+		"delta": "I need to inspect the repo."
+	}`
+
+	event, _, err := parseStreamData(data)
+	if err != nil {
+		t.Fatalf("parseStreamData() error = %v", err)
+	}
+	if got, want := event.ReasoningDelta, "I need to inspect the repo."; got != want {
+		t.Fatalf("ReasoningDelta = %q, want %q", got, want)
 	}
 }
 

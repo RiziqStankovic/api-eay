@@ -53,11 +53,12 @@ type Client interface {
 }
 
 type StreamEvent struct {
-	Type        string
-	Delta       string
-	ToolCall    *types.ToolCall
-	OutputIndex int
-	Done        bool
+	Type           string
+	Delta          string
+	ReasoningDelta string
+	ToolCall       *types.ToolCall
+	OutputIndex    int
+	Done           bool
 }
 
 type client struct {
@@ -129,10 +130,14 @@ func (c *client) ChatCompletion(ctx context.Context, req types.ChatCompletionReq
 	}
 
 	var out strings.Builder
+	var reasoningOut strings.Builder
 	var toolCalls []types.ToolCall
 	usage, err := c.streamFromUpstream(ctx, req, func(event StreamEvent) error {
 		if event.Delta != "" {
 			out.WriteString(event.Delta)
+		}
+		if event.ReasoningDelta != "" {
+			reasoningOut.WriteString(event.ReasoningDelta)
 		}
 		if event.ToolCall != nil {
 			toolCalls = upsertToolCall(toolCalls, *event.ToolCall)
@@ -157,9 +162,10 @@ func (c *client) ChatCompletion(ctx context.Context, req types.ChatCompletionReq
 			{
 				Index: 0,
 				Message: types.ChatCompletionMessage{
-					Role:      "assistant",
-					Content:   types.MessageContent{Text: out.String()},
-					ToolCalls: toolCalls,
+					Role:             "assistant",
+					Content:          types.MessageContent{Text: out.String()},
+					ReasoningContent: reasoningOut.String(),
+					ToolCalls:        toolCalls,
 				},
 				FinishReason: finishReason,
 			},
@@ -414,6 +420,8 @@ type upstreamRequest struct {
 	Tools             []any  `json:"tools,omitempty"`
 	ToolChoice        any    `json:"tool_choice,omitempty"`
 	ParallelToolCalls *bool  `json:"parallel_tool_calls,omitempty"`
+	Reasoning         any    `json:"reasoning,omitempty"`
+	Thinking          any    `json:"thinking,omitempty"`
 }
 
 func buildUpstreamRequest(req types.ChatCompletionRequest, stream bool, defaultInstructions string) upstreamRequest {
@@ -468,6 +476,9 @@ func buildUpstreamRequest(req types.ChatCompletionRequest, stream bool, defaultI
 	if joinedInstructions == "" {
 		joinedInstructions = "You are a helpful coding assistant."
 	}
+	if guidance := zedToolGuidance(req.Tools); guidance != "" {
+		joinedInstructions = strings.TrimSpace(joinedInstructions + "\n\n" + guidance)
+	}
 	return upstreamRequest{
 		Model:             req.Model,
 		Instructions:      joinedInstructions,
@@ -477,6 +488,98 @@ func buildUpstreamRequest(req types.ChatCompletionRequest, stream bool, defaultI
 		Tools:             normalizeToolsForResponses(req.Tools),
 		ToolChoice:        req.ToolChoice,
 		ParallelToolCalls: req.ParallelToolCalls,
+		Reasoning:         normalizeReasoning(req),
+		Thinking:          normalizeThinking(req.Thinking),
+	}
+}
+
+func normalizeReasoning(req types.ChatCompletionRequest) any {
+	if req.Reasoning != nil {
+		return normalizeReasoningValue(req.Reasoning)
+	}
+	if effort := normalizeReasoningEffort(req.ReasoningEffort); effort != "" {
+		return map[string]any{"effort": effort}
+	}
+	if effort := thinkingEffort(req.Thinking); effort != "" {
+		return map[string]any{"effort": effort}
+	}
+	return nil
+}
+
+func normalizeReasoningValue(value any) any {
+	switch v := value.(type) {
+	case map[string]any:
+		out := make(map[string]any, len(v))
+		for key, child := range v {
+			if strings.EqualFold(key, "effort") {
+				if effort := normalizeReasoningEffort(fmt.Sprint(child)); effort != "" {
+					out[key] = effort
+				}
+				continue
+			}
+			out[key] = child
+		}
+		return out
+	default:
+		if effort := normalizeReasoningEffort(fmt.Sprint(v)); effort != "" {
+			return map[string]any{"effort": effort}
+		}
+		return value
+	}
+}
+
+func normalizeThinking(value any) any {
+	if value == nil {
+		return nil
+	}
+	switch v := value.(type) {
+	case map[string]any:
+		out := make(map[string]any, len(v))
+		for key, child := range v {
+			if strings.EqualFold(key, "effort") || strings.EqualFold(key, "budget") || strings.EqualFold(key, "level") {
+				if effort := normalizeReasoningEffort(fmt.Sprint(child)); effort != "" {
+					out[key] = effort
+				}
+				continue
+			}
+			out[key] = child
+		}
+		return out
+	default:
+		return value
+	}
+}
+
+func thinkingEffort(value any) string {
+	switch v := value.(type) {
+	case map[string]any:
+		for _, key := range []string{"effort", "budget", "level"} {
+			if raw, ok := v[key]; ok {
+				if effort := normalizeReasoningEffort(fmt.Sprint(raw)); effort != "" {
+					return effort
+				}
+			}
+		}
+	case string:
+		return normalizeReasoningEffort(v)
+	}
+	return ""
+}
+
+func normalizeReasoningEffort(raw string) string {
+	switch strings.ToLower(strings.ReplaceAll(strings.TrimSpace(raw), "_", " ")) {
+	case "minimal", "min":
+		return "minimal"
+	case "low":
+		return "low"
+	case "medium", "normal":
+		return "medium"
+	case "high":
+		return "high"
+	case "extra high", "extra-high", "xhigh", "x-high":
+		return "high"
+	default:
+		return ""
 	}
 }
 
@@ -518,6 +621,39 @@ func normalizeToolsForResponses(tools []types.ToolDefinition) []any {
 		})
 	}
 	return out
+}
+
+func zedToolGuidance(tools []types.ToolDefinition) string {
+	if !hasKnownZedTools(tools) {
+		return ""
+	}
+	return `## Zed Tool Use
+
+When using Zed tools, call tools only when the arguments are concrete and valid JSON objects.
+
+- For list_directory, use an absolute or workspace-relative directory path.
+- For find_path, use workspace-relative globs with forward slashes, not absolute Windows paths. Example: use auto-repo-xl/**/README*, not D:\xl\auto-repo-xl/**/README*. Use it sparingly. Do not repeat the same broad pattern after a "No matches" result; switch to list_directory, read_file, or a narrower pattern.
+- For diagnostics, omit the path when checking project diagnostics. Only pass a path when it is a concrete file path, not a directory or workspace name. Never pass null, "null", ".null", "/", or an empty path.
+- After discovering a likely file path, prefer read_file over repeated search calls.
+- If several tool calls fail, stop retrying and explain what failed instead of issuing more similar calls.`
+}
+
+func hasKnownZedTools(tools []types.ToolDefinition) bool {
+	for _, tool := range tools {
+		name := normalizedToolName(tool)
+		switch name {
+		case "list_directory", "find_path", "read_file", "diagnostics", "grep", "terminal":
+			return true
+		}
+	}
+	return false
+}
+
+func normalizedToolName(tool types.ToolDefinition) string {
+	if name := strings.TrimSpace(tool.Name); name != "" {
+		return name
+	}
+	return strings.TrimSpace(tool.Function.Name)
 }
 
 func firstNonEmpty(values ...string) string {
@@ -689,6 +825,8 @@ func parseStreamData(data string) (StreamEvent, types.Usage, error) {
 	switch raw.Type {
 	case "response.output_text.delta":
 		return StreamEvent{Type: raw.Type, Delta: raw.Delta, OutputIndex: raw.OutputIndex}, types.Usage{}, nil
+	case "response.reasoning_text.delta", "response.reasoning_summary_text.delta", "response.reasoning.delta", "response.reasoning_summary.delta":
+		return StreamEvent{Type: raw.Type, ReasoningDelta: raw.Delta, OutputIndex: raw.OutputIndex}, types.Usage{}, nil
 	case "response.output_item.added", "response.output_item.done":
 		if raw.Item == nil || raw.Item.Type != "function_call" {
 			return StreamEvent{}, types.Usage{}, nil
