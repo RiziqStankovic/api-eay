@@ -228,7 +228,7 @@ type AltInputItem struct {
 	Content   MessageContent `json:"content,omitempty"`
 	Name      string         `json:"name,omitempty"`
 	Arguments string         `json:"arguments,omitempty"`
-	Output    string         `json:"output,omitempty"`
+	Output    MessageContent `json:"output,omitempty"`
 }
 
 // ToChatCompletionRequest converts AltChatRequest to ChatCompletionRequest.
@@ -274,7 +274,7 @@ func (a AltChatRequest) ToChatCompletionRequest() ChatCompletionRequest {
 			messages = append(messages, ChatCompletionMessage{
 				Role:       "tool",
 				ToolCallID: callID,
-				Content:    MessageContent{Text: item.Output},
+				Content:    MessageContent{Text: item.Output.PlainText()},
 			})
 		default:
 			continue

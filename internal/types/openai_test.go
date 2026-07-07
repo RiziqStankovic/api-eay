@@ -140,3 +140,37 @@ func TestAltChatRequestPreservesResponsesToolState(t *testing.T) {
 		t.Fatalf("tool output = %q, want README.md", tool.Content.PlainText())
 	}
 }
+
+func TestAltChatRequestAcceptsFunctionCallOutputContentParts(t *testing.T) {
+	raw := []byte(`{
+		"model": "gpt-5.4-mini",
+		"input": [
+			{
+				"type":"function_call_output",
+				"call_id":"call_123",
+				"output":[{"type":"input_text","text":"# Folders:\nmiawai\ncustomai-gateway-go"}]
+			}
+		],
+		"stream": true
+	}`)
+
+	var req AltChatRequest
+	if err := json.Unmarshal(raw, &req); err != nil {
+		t.Fatalf("unmarshal alt request: %v", err)
+	}
+
+	chatReq := req.ToChatCompletionRequest()
+	if got, want := len(chatReq.Messages), 1; got != want {
+		t.Fatalf("messages len = %d, want %d", got, want)
+	}
+	msg := chatReq.Messages[0]
+	if got, want := msg.Role, "tool"; got != want {
+		t.Fatalf("role = %q, want %q", got, want)
+	}
+	if got, want := msg.ToolCallID, "call_123"; got != want {
+		t.Fatalf("tool call id = %q, want %q", got, want)
+	}
+	if !strings.Contains(msg.Content.PlainText(), "customai-gateway-go") {
+		t.Fatalf("tool output = %q, want customai-gateway-go", msg.Content.PlainText())
+	}
+}
